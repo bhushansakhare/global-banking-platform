@@ -1,0 +1,35 @@
+# secrets
+.env
+*.env
+!.env.example
+backend/.dbpass
+
+# python
+__pycache__/
+*.pyc
+backend/.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# node
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# tauri / rust
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+
+# runtime data (statements, reports and exports contain financial data)
+storage/statements/*
+storage/reports/*
+storage/exports/*
+!storage/**/.gitkeep
+
+# misc
+.playwright-mcp/
+.DS_Store
+Thumbs.db
+*.log

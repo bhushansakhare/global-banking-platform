@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --canvas: 246 247 251;
+    --surface: 255 255 255;
+    --surface-2: 248 249 252;
+    --line: 228 230 239;
+    --ink: 17 19 41;
+    --muted: 100 104 130;
+    color-scheme: light;
+  }
+  .dark {
+    --canvas: 11 12 24;
+    --surface: 19 20 36;
+    --surface-2: 25 27 46;
+    --line: 41 43 66;
+    --ink: 236 237 245;
+    --muted: 150 153 180;
+    color-scheme: dark;
+  }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    @apply bg-canvas text-ink font-sans antialiased;
+    font-feature-settings: 'cv11', 'ss01';
+    min-width: 320px;
+  }
+  .num { font-variant-numeric: tabular-nums; }
+  :focus-visible { @apply outline-none ring-2 ring-accent-500/70 ring-offset-2 ring-offset-canvas; }
+  ::selection { @apply bg-brand-200 text-brand-900; }
+  * { scrollbar-width: thin; scrollbar-color: rgb(var(--line)) transparent; }
+}
+
+@layer components {
+  .card { @apply bg-surface border border-line rounded-2xl shadow-card; }
+  .label { @apply block text-[13px] font-medium text-ink mb-1.5; }
+  .input {
+    @apply w-full h-10 rounded-lg border border-line bg-surface px-3 text-sm text-ink placeholder:text-muted/70
+      transition focus:border-brand-400 focus:ring-2 focus:ring-brand-500/20 focus:outline-none disabled:opacity-60;
+  }
+  .kbd { @apply inline-flex items-center rounded border border-line bg-surface-2 px-1.5 text-[11px] font-medium text-muted; }
+  .link { @apply text-brand-600 hover:text-brand-700 dark:text-brand-300 dark:hover:text-brand-200 font-medium; }
+}

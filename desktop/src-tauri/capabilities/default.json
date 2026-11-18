@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Minimal capabilities: the UI talks to the local backend over HTTP only; no shell or filesystem access is granted to the webview.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
