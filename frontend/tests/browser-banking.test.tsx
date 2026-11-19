@@ -21,6 +21,20 @@ const status: BrowserStatus = {
 describe('Bank browser connection', () => {
   beforeEach(() => { useAuth.getState().clear(); signIn(); });
 
+  it('opens QR login without sending typed or saved credentials', async () => {
+    const fetch = mockFetch({ '/accounts/a1/browser': { ...status, has_customer_id: true, has_password: true },
+      '/accounts/a1/browser/start': { job_id: 'qr1', status: 'queued', created: true } });
+    renderWithProviders(<BrowserBankConnection account={account} />);
+    await screen.findByLabelText('Customer ID / User ID');
+    await userEvent.type(screen.getByLabelText('Customer ID / User ID'), 'UNSAVED-CUSTOMER');
+    await userEvent.click(screen.getByRole('button', { name: 'QR / bank app login' }));
+    await waitFor(() => expect(fetch.mock.calls.some(([url, init]) => {
+      if (!String(url).endsWith('/browser/start')) return false;
+      const body = JSON.parse(String(init?.body));
+      return body.qr_login === true && body.login_only === true && !body.authenticate && !body.customer_id && !body.password;
+    })).toBe(true));
+  });
+
   it('opens official login without claiming an unverified statement workflow works', async () => {
     const fetch = mockFetch({ '/accounts/a1/browser': status,
       '/accounts/a1/browser/start': { job_id: 'j1', status: 'queued', created: true } });
@@ -108,5 +122,14 @@ describe('Bank browser connection', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Open bank login' }));
     await waitFor(() => expect(fetch.mock.calls.some(([u, init]) => String(u).endsWith('/browser/start')
       && JSON.parse(String(init?.body)).login_only === true && !JSON.parse(String(init?.body)).authenticate)).toBe(true));
+  });
+
+  it('shows the configured visible verification wait without opening a bank automatically', async () => {
+    const current = structuredClone(status);
+    current.verification_wait_seconds = 60;
+    const fetch = mockFetch({ '/accounts/a1/browser': current });
+    renderWithProviders(<BrowserBankConnection account={account} />);
+    await screen.findByText(/visible bank window waits up to 60 seconds/i);
+    expect(fetch.mock.calls.filter(([, init]) => init?.method === 'POST')).toHaveLength(0);
   });
 });

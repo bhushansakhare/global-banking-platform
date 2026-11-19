@@ -12,6 +12,7 @@ from app.integrations.banks.browser_engine import retrieve, validate_download
 from app.integrations.banks.profiles import find_profile
 from app.models.banking import BankAccount
 from app.statements.pipeline import register_statement
+from app.services.monitoring import settings_for as monitoring_for
 
 
 def saved_login_profile(db, account):
@@ -48,16 +49,20 @@ def enqueue_saved_login(db, account, user_id, *, run_id=None):
         AutomationJob.status.in_(queue.ACTIVE_STATES)).limit(1))
     if active:
         if active.status == "awaiting_user" and active.payload.get("profile_key") == profile.key:
-            active.payload = {**active.payload, "authenticate": True, "interactive_approved": True}
+            active.payload = {**active.payload, "authenticate": True, "interactive_approved": True,
+                              "user_requested_browser": True, "qr_login": False}
             active.status, active.run_after, active.requires_user_action = "queued", queue.now(), None
             active.error_code = active.error_message = None
+            active.trigger = "manual"
+            if run_id is not None:
+                active.run_id = run_id
         return active, False
     # Keep using the login handler until collection has a genuine browser connection/profile binding.
     collect = profile.retrieval_supported and account.connection.provider.code == "browser_automation" \
         and account.browser_profile_key == profile.key
     return queue.enqueue(db, tenant_id=account.tenant_id, account_id=account.id,
         job_type="collect_account" if collect else "open_bank_login", trigger="manual", run_id=run_id,
-        payload={"profile_key": profile.key, "authenticate": True}, max_attempts=1, created_by=user_id)
+        payload={"profile_key": profile.key, "authenticate": True, "user_requested_browser": True}, max_attempts=1, created_by=user_id)
 
 
 def browser_collect(ctx, *, login_only=False):
@@ -79,12 +84,15 @@ def browser_collect(ctx, *, login_only=False):
         raise ConfigurationMissing("Bank browser profile was removed; select a reviewed profile") from None
     if not login_only and not profile.retrieval_supported:
         raise ConfigurationMissing("Bank browser profile requires review before statement retrieval")
+    qr_login = bool(job.payload.get("qr_login"))
     creds = decrypt_json(account.browser_identifier_encrypted, str(job.tenant_id)) \
-        if account.browser_identifier_encrypted else {}
+        if account.browser_identifier_encrypted and not qr_login else {}
     if creds.get("scope") != profile.credential_scope:
         creds = {"customer_id": creds.get("customer_id", "")} if "scope" not in creds else {}
-    use_saved_password = bool(job.payload.get("authenticate") or job.payload.get("interactive_approved")
-                              or (not login_only and job.trigger == "manual"))
+    use_saved_password = not qr_login and bool(job.payload.get("authenticate") or job.payload.get("interactive_approved")
+                                             or (not login_only and job.trigger == "manual"))
+    monitoring = monitoring_for(db, account)
+    screenshot = []
     today = datetime.now(UTC).date()
     start = date.fromisoformat(job.payload["date_from"]) if job.payload.get("date_from") else today - timedelta(days=30)
     end = date.fromisoformat(job.payload["date_to"]) if job.payload.get("date_to") else today
@@ -111,7 +119,9 @@ def browser_collect(ctx, *, login_only=False):
                              password=creds.get("password", "") if use_saved_password else "",
                              on_review=review if login_only else None,
                              masked_number=account.account_number_masked, date_from=start, date_to=end,
-                             progress=progress, login_only=login_only)
+                             progress=progress, login_only=login_only,
+                             verification_wait_seconds=monitoring.verification_wait_seconds,
+                             on_statement_screenshot=screenshot.append if monitoring.capture_statement_screenshot and not login_only else None)
         finally:
             lock.execute(text("SELECT pg_advisory_unlock(1748123901)"))
             lock.commit()
@@ -125,6 +135,17 @@ def browser_collect(ctx, *, login_only=False):
         validate_download(content, name, profile.formats)
         st, duplicate = register_statement(db, account=account, content=content, filename=name,
                                             source="browser_download")
+        if screenshot:
+            from app.statements.storage import save_generated
+            from app.models.system import SystemSetting
+            path = save_generated("bank_evidence", account.tenant_id, f"{st.id}.png", screenshot[-1])
+            key = f"statement_evidence:{st.id}"
+            evidence = db.scalar(select(SystemSetting).where(SystemSetting.tenant_id == account.tenant_id,
+                                                             SystemSetting.key == key))
+            if evidence is None:
+                evidence = SystemSetting(tenant_id=account.tenant_id, key=key)
+                db.add(evidence)
+            evidence.value = {"path": path, "captured_at": datetime.now(UTC).isoformat(), "source": "bank_statement_screen"}
         duplicates += int(duplicate)
         if not duplicate:
             added += 1

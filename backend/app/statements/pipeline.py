@@ -14,7 +14,7 @@ from pathlib import PurePath
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.balances.service import record_snapshot
+from app.balances.service import check_low_balance, record_snapshot
 from app.core.config import get_settings
 from app.core.errors import ValidationFailed
 from app.core.logging import get_logger
@@ -116,6 +116,8 @@ def process_statement(db: Session, statement_id: uuid.UUID, *, job_id: uuid.UUID
     if result.currency and result.currency != account.currency:
         result.warn("currency_mismatch", f"Statement currency {result.currency} differs from account currency "
                                          f"{account.currency}")
+    currency_matches = not result.currency or result.currency == account.currency
+    st.currency = result.currency or account.currency
 
     items = [IncomingTransaction(booking_date=r.booking_date, value_date=r.value_date, description=r.description,
                                  reference=r.reference, debit=r.debit, credit=r.credit,
@@ -134,11 +136,11 @@ def process_statement(db: Session, statement_id: uuid.UUID, *, job_id: uuid.UUID
     st.parse_confidence = result.confidence
     st.warnings = result.warnings[:100]
 
-    if st.period_start and st.opening_balance is not None:
+    if currency_matches and st.period_start and st.opening_balance is not None:
         record_snapshot(db, account=account, balance_type="statement_opening", amount=st.opening_balance,
                         currency=st.currency, as_of=datetime.combine(st.period_start, time.min, UTC),
                         source="statement", source_ref=str(st.id), job_id=job_id)
-    if st.period_end and st.closing_balance is not None:
+    if currency_matches and st.period_end and st.closing_balance is not None:
         record_snapshot(db, account=account, balance_type="statement_closing", amount=st.closing_balance,
                         currency=st.currency, as_of=datetime.combine(st.period_end, time(23, 59, 59), UTC),
                         source="statement", source_ref=str(st.id), job_id=job_id)
@@ -158,7 +160,7 @@ def process_statement(db: Session, statement_id: uuid.UUID, *, job_id: uuid.UUID
 
     if not result.rows:
         st.processing_status = "needs_review"
-    elif result.arithmetic_valid is False or result.confidence < Decimal("0.8"):
+    elif not currency_matches or result.arithmetic_valid is False or result.confidence < Decimal("0.8"):
         st.processing_status = "needs_review"
     elif result.warnings:
         st.processing_status = "processed_with_warnings"
@@ -177,6 +179,7 @@ def process_statement(db: Session, statement_id: uuid.UUID, *, job_id: uuid.UUID
                body="Extraction confidence is low or the balances do not reconcile arithmetically.",
                link=f"/statements/{st.id}", entity_type="statement", entity_id=st.id)
     db.flush()
+    check_low_balance(db, account)
     log.info("statement processed", extra={"ctx": {"statement": str(st.id), "status": st.processing_status,
                                                    "rows": len(result.rows), "inserted": ing.inserted}})
     return pj

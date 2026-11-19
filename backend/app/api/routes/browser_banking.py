@@ -29,6 +29,7 @@ class BrowserStart(BaseModel):
     date_to: date | None = None
     login_only: bool = False
     authenticate: bool = False
+    qr_login: bool = False
 
 
 class SavedBankLogin(BaseModel):
@@ -143,6 +144,7 @@ def browser_status(account_id: uuid.UUID, db: DB, p: Principal = require("accoun
                     .order_by(AutomationJob.created_at.desc()).limit(1))
     credentials = scoped_credentials(a, preferred) if preferred else {}
     return {"enabled": get_settings().browser_automation_enabled,
+            "browser_mode": "headed", "verification_wait_seconds": get_settings().browser_login_timeout_seconds,
             "profile_key": preferred.key if preferred else None,
             "has_customer_id": bool(credentials.get("customer_id")),
             "has_password": bool(credentials.get("password")),
@@ -171,7 +173,9 @@ def start_browser(account_id: uuid.UUID, body: BrowserStart, db: DB,
     if not body.login_only and not profile.retrieval_supported:
         raise Conflict("This bank's statement workflow is unverified. Open official login or use statement upload.",
                        code="browser_profile_review_required")
-    credentials = scoped_credentials(a, profile)
+    if body.qr_login and (body.authenticate or body.customer_id is not None):
+        raise ValidationFailed("QR login cannot also submit saved credentials or change the Customer ID")
+    credentials = {} if body.qr_login else scoped_credentials(a, profile)
     if body.authenticate:
         if body.customer_id is not None and body.customer_id != credentials.get("customer_id"):
             raise ValidationFailed("Save the changed Customer ID and password before authenticating")
@@ -185,10 +189,13 @@ def start_browser(account_id: uuid.UUID, body: BrowserStart, db: DB,
                        AutomationJob.status.in_(queue.ACTIVE_STATES),
                        AutomationJob.job_type.in_(["collect_account", "open_bank_login"])).limit(1))
     if active:
+        if active.status != "awaiting_user" and bool(active.payload.get("qr_login")) != body.qr_login:
+            raise Conflict("Close the current bank session before switching the login method")
         if active.status == "awaiting_user" and ((body.login_only and active.payload.get("profile_key") == profile.key)
                                                  or (not body.login_only and a.browser_profile_key == profile.key)):
             active.payload = {**active.payload, "interactive_approved": not body.login_only or body.authenticate,
-                              "authenticate": body.authenticate}
+                              "authenticate": body.authenticate, "qr_login": body.qr_login, "user_requested_browser": True}
+            active.trigger = "manual"
             active.status, active.run_after, active.requires_user_action = "queued", queue.now(), None
             active.error_code = active.error_message = None
         return {"job_id": str(active.id), "created": False, "status": active.status}
@@ -218,7 +225,8 @@ def start_browser(account_id: uuid.UUID, body: BrowserStart, db: DB,
     job, created = queue.enqueue(db, tenant_id=p.tenant_id,
                                 job_type="open_bank_login" if body.login_only else "collect_account",
                                 account_id=a.id, payload={"profile_key": profile.key,
-                                "date_from": start.isoformat(), "date_to": end.isoformat(), "authenticate": body.authenticate},
+                                "date_from": start.isoformat(), "date_to": end.isoformat(), "authenticate": body.authenticate,
+                                "user_requested_browser": True, "qr_login": body.qr_login},
                                 max_attempts=1, created_by=p.user_id)
     audit(db, action="browser.login.open" if body.login_only else "browser.sync.start", tenant_id=p.tenant_id,
           actor_user_id=p.user_id, entity_type="bank_account", entity_id=a.id, meta={"profile_key": profile.key})

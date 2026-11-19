@@ -59,8 +59,14 @@ def views_for(db, tenant_id, accounts: list[BankAccount]) -> dict[Any, dict[str,
     for account in accounts:
         if not is_manual(account) or not saved_login_profile(db, account):
             continue
+        from app.core.config import get_settings
+        browser_enabled = get_settings().browser_automation_enabled
         job = latest.get(account.id)
-        if job and job.status in ("queued", "running", "retry_scheduled"):
+        if not browser_enabled:
+            view = AutomationView("provider_setup_required", "The local bank browser is disabled. Start the browser-enabled backend before running authentication.", None, None, "connect")
+        elif job and job.status == "failed" and job.error_code in ("provider_not_configured", "browser_disabled"):
+            view = AutomationView("ready", "The visible bank browser is now enabled. Run now starts a fresh login using your saved details.", None, None, None)
+        elif job and job.status in ("queued", "running", "retry_scheduled"):
             view = AutomationView("running", job.progress_message or "Opening the visible bank browser", None, None, None)
         elif job and job.status == "awaiting_user":
             view = AutomationView("waiting_for_user", job.error_message or "Complete verification on the bank page", None, None, "authorize")

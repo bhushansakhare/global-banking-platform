@@ -5,6 +5,7 @@ import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { Button, Card, CardHeader, DemoBadge, Field, Input, Select, StatusBadge } from '@/components/ui/primitives';
 import { DataTable, Pagination } from '@/components/ui/DataTable';
 import { AutomationActions, AutomationSummary } from '@/features/accounts/AutomationControls';
+import { MonitoringControls } from '@/features/accounts/MonitoringControls';
 import { ConnectionSetupModal } from '@/features/accounts/ConnectionSetupModal';
 import { ConfirmDialog, Modal } from '@/components/ui/Modal';
 import { KeyValue, Notice, PageHeader } from '@/components/ui/layout';
@@ -24,7 +25,7 @@ function EditModal({ a, open, onClose }: { a: Account; open: boolean; onClose: (
   const [f, setF] = useState({ nickname: a.nickname, holder_name: a.holder_name ?? '', low_balance_threshold: a.low_balance_threshold ?? '',
     statement_period: a.statement_period, notes: a.notes ?? '', account_type: a.account_type, sync_schedule: a.sync_schedule ?? '',
     timezone: a.timezone ?? '' });
-  const save = useAction(() => accountsApi.update(a.id, { ...f, low_balance_threshold: f.low_balance_threshold || undefined,
+  const save = useAction(() => accountsApi.update(a.id, { ...f, low_balance_threshold: f.low_balance_threshold || null,
     sync_schedule: f.sync_schedule.trim() || null, timezone: f.timezone.trim() || undefined }),
     { success: 'Account updated', invalidate: [['account', a.id], ['accounts']], onSuccess: onClose });
   const submit = (e: FormEvent) => { e.preventDefault(); save.mutate(undefined); };
@@ -96,6 +97,7 @@ export default function AccountDetail() {
           subtitle="Healthy is shown only after a verified synchronisation with live data." action={<AutomationActions account={a} onConnect={() => setConnectOpen(true)} size="sm" />} />
         <AutomationSummary account={a} />
       </Card>
+      <MonitoringControls account={a} editable={can('accounts:write')} />
       {a.is_demo && <div className="mb-5"><Notice tone="demo">This account is connected to the Demo Bank Simulator. All balances, transactions and statements are synthetic.</Notice></div>}
 
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">

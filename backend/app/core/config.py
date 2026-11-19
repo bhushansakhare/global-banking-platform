@@ -56,9 +56,18 @@ class Settings(BaseSettings):
     job_timeout_seconds: int = 900
     job_stale_seconds: int = 300
     browser_automation_enabled: bool = False
-    browser_login_timeout_seconds: int = Field(default=600, ge=30, le=720)
+    browser_login_timeout_seconds: int = Field(default=600, ge=60, le=720)
     browser_channel: str = Field(default="msedge" if sys.platform == "win32" else "chromium",
                                  pattern="^(chromium|msedge|chrome)$")
+
+    # Outgoing low-balance alerts. Credentials stay in the local environment.
+    smtp_host: str = ""
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_from: str = ""
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_security: str = Field(default="starttls", pattern="^(starttls|ssl)$")
+    ocr_tessdata_dir: Path = BACKEND_DIR / "vendor" / "tessdata"
 
     # Demo
     allow_demo: bool = True

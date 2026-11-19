@@ -310,3 +310,6 @@ HANDLERS: dict[str, Callable[[JobContext], dict[str, Any]]] = {
 
 from app.automation.browser_jobs import open_bank_login  # noqa: E402
 HANDLERS["open_bank_login"] = open_bank_login
+from app.notifications.email import send_balance_email  # noqa: E402
+HANDLERS["low_balance_email"] = send_balance_email
+HANDLERS["balance_email"] = send_balance_email

@@ -2,9 +2,9 @@ import { useQuery } from '@tanstack/react-query';
 import { ArrowLeft, Download, Eye, GitCompareArrows, RefreshCcw } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { Badge, Button, Card, CardHeader, DemoBadge, StatusBadge } from '@/components/ui/primitives';
+import { Badge, Button, Card, CardHeader, DemoBadge, Input, StatusBadge } from '@/components/ui/primitives';
 import { DataTable } from '@/components/ui/DataTable';
-import { Modal } from '@/components/ui/Modal';
+import { ConfirmDialog, Modal } from '@/components/ui/Modal';
 import { KeyValue, Notice, PageHeader } from '@/components/ui/layout';
 import { ErrorState, TableSkeleton } from '@/components/ui/States';
 import { DebitCredit, Money } from '@/components/Money';
@@ -42,6 +42,14 @@ export default function StatementDetail() {
   const navigate = useNavigate();
   const can = useAuth((s) => s.can);
   const [preview, setPreview] = useState(false);
+  const [confirmFigures, setConfirmFigures] = useState(false);
+  const confirmExtraction = useAction(() => request(`/statements/${id}/confirm-extraction`, { method: 'POST' }), {
+    success: 'Reviewed figures confirmed', invalidate: [['statement', id], ['statements'], ['account'], ['notifications']],
+    onSuccess: () => setConfirmFigures(false),
+  });
+  const [imagePage, setImagePage] = useState('1');
+  const imageDownload = useAction(() => download(`/statements/${id}/screenshot`, { page: Number(imagePage) }, `statement-page-${imagePage}.png`), {});
+  const bankImageDownload = useAction(() => download(`/statements/${id}/screenshot`, { source: 'bank' }, 'bank-statement-screen.png'), {});
   const q = useQuery({ queryKey: ['statement', id], queryFn: () => statementsApi.get(id) });
   const tx = useQuery({ queryKey: ['statement', id, 'tx'], queryFn: () => statementsApi.transactions(id) });
   const reprocess = useAction(() => statementsApi.reprocess(id), { success: 'Statement reprocessed', invalidate: [['statement', id], ['statements']] });
@@ -63,10 +71,24 @@ export default function StatementDetail() {
           <Button variant="outline" icon={<Eye className="h-4 w-4" />} onClick={() => setPreview(true)}>Preview</Button>
           <Button variant="outline" icon={<Download className="h-4 w-4" />} onClick={() => download(`/statements/${id}/file`, undefined, s.file?.original_filename)}>Download original</Button>
           {can('statements:write') && <Button variant="outline" icon={<RefreshCcw className="h-4 w-4" />} loading={reprocess.isPending} onClick={() => reprocess.mutate(undefined)}>Reprocess</Button>}
+          {can('statements:write') && s.processing_status === 'needs_review' && s.arithmetic_valid && !!s.transaction_count &&
+            <Button variant="outline" onClick={() => setConfirmFigures(true)}>Confirm reviewed figures</Button>}
           {can('reconciliation:write') && <Button icon={<GitCompareArrows className="h-4 w-4" />} loading={recon.isPending} onClick={() => recon.mutate(undefined)}
             disabled={!s.period_start}>Reconcile</Button>}
         </>} />
       {s.is_demo && <div className="mb-4"><Notice tone="demo">Synthetic demo statement produced by the Demo Bank Simulator — not a real bank document.</Notice></div>}
+      {(s.file?.format === 'pdf' || s.bank_screenshot_available) && <Card className="mb-4">
+        <CardHeader title="Statement images" subtitle="Download an image of any PDF page or the bank statement screen captured during collection." />
+        <div className="flex flex-wrap items-end gap-3">
+          {s.file?.format === 'pdf' && <>
+            <label className="text-sm">PDF page
+              <Input aria-label="Statement image page" type="number" min="1" max={s.file.page_count ?? undefined} value={imagePage} onChange={(e) => setImagePage(e.target.value)} className="mt-1 w-28" />
+            </label>
+            <Button variant="outline" loading={imageDownload.isPending} disabled={!Number.isInteger(Number(imagePage)) || Number(imagePage) < 1} onClick={() => imageDownload.mutate(undefined)}>Download page image</Button>
+          </>}
+          {s.bank_screenshot_available && <Button variant="outline" loading={bankImageDownload.isPending} onClick={() => bankImageDownload.mutate(undefined)}>Download bank screen</Button>}
+        </div>
+      </Card>}
       {s.processing_status === 'needs_ocr' && <div className="mb-4"><Notice tone="warning" title="Scanned document">
         This PDF contains no extractable text. OCR with manual verification is required — figures are never guessed.</Notice></div>}
       {s.duplicate_of_id && <div className="mb-4"><Notice tone="warning">Another statement covers the same period. <Link className="link" to={`/statements/${s.duplicate_of_id}`}>Open it</Link></Notice></div>}
@@ -116,6 +138,9 @@ export default function StatementDetail() {
         ]} />
       </Card>
       <Preview id={id} open={preview} onClose={() => setPreview(false)} format={s.file?.format ?? ''} />
+      <ConfirmDialog open={confirmFigures} onClose={() => setConfirmFigures(false)} title="Confirm extracted figures?"
+        body="Check every extracted transaction and the balances against the original statement first. Confirming makes this dated closing balance eligible for your account's target alerts."
+        confirmLabel="Confirm reviewed figures" loading={confirmExtraction.isPending} onConfirm={() => confirmExtraction.mutate(undefined)} />
     </>
   );
 }

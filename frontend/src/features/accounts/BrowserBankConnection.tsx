@@ -35,6 +35,10 @@ export function BrowserBankConnection({ account }: { account: Account }) {
     profile_key: selected || q.data?.profile_key || '', login_only: !profile?.capabilities.automatic_statement_retrieval,
     authenticate: true, date_from: from || undefined, date_to: to || undefined,
   }), { invalidate: invalidations, success: 'Authentication queued — finish any bank verification in the visible browser' });
+  const qrLogin = useAction(() => browserBankingApi.start(account.id, {
+    profile_key: selected || q.data?.profile_key || '', login_only: !profile?.capabilities.automatic_statement_retrieval,
+    qr_login: true, date_from: from || undefined, date_to: to || undefined,
+  }), { invalidate: invalidations, success: 'Bank window queued — choose the bank’s QR login and approve in its official app' });
   const save = useAction((body: { key: string }) => browserBankingApi.saveProfile(body.key, body), {
     invalidate: invalidations, onSuccess: () => { setEditing(false); setConfigError(null); }, success: 'Bank profile saved',
   });
@@ -46,7 +50,8 @@ export function BrowserBankConnection({ account }: { account: Account }) {
   if (account.is_demo) return null;
   return <section className="rounded-xl border border-brand-500 p-4 space-y-4" aria-label="Bank website connection">
     <div><div className="flex flex-wrap items-center gap-2"><h3 className="font-semibold text-ink">Connect through your bank website</h3><Badge tone="info">Visible browser (headed)</Badge></div>
-      <p className="text-sm text-muted">Save your bank login, then Authenticate to fill and submit it on the official website. Complete OTP, CAPTCHA or app approval in the bank browser.</p></div>
+      <p className="text-sm text-muted">Choose QR / bank app login, or save your bank login and Authenticate. Complete verification in the official bank window or banking app.</p></div>
+    {q.data?.enabled && <p className="text-sm text-muted">The visible bank window waits up to {q.data.verification_wait_seconds ?? 600} seconds for OTP, CAPTCHA or app approval. Complete verification there; do not enter OTP in this app.</p>}
     {q.error && <Notice tone="danger">{errorText(q.error)}</Notice>}
     <Field label="Search bank" htmlFor="browser-bank-search"><Input id="browser-bank-search" value={search}
       onChange={(e) => setSearch(e.target.value)} placeholder="Bank name, code or website" /></Field>
@@ -60,6 +65,12 @@ export function BrowserBankConnection({ account }: { account: Account }) {
     {profile && <>
       <div className="flex flex-wrap items-center gap-2 text-sm"><StatusBadge status={profile.capabilities.browser_login} />
         <a className="link break-all" href={profile.login_url} target="_blank" rel="noopener noreferrer">Official bank login</a></div>
+      <div className="rounded-lg bg-surface-2 p-3 space-y-2">
+        <Button variant="outline" disabled={!canConnect || !q.data?.enabled || !!busy} loading={qrLogin.isPending}
+          onClick={() => qrLogin.mutate(undefined)}>QR / bank app login</Button>
+        <p className="text-sm text-muted">If your bank offers QR login, choose its QR option in the visible bank window, then scan and approve with its official banking app. Saved ID/password are not submitted in this mode. After approval, a supported statement workflow continues automatically.</p>
+        {profile.key === 'hdfc_bank' && <a className="link text-sm" href="https://www.hdfc.bank.in/resources/way-to-bank/online-banking/net-banking/two-step-verification" target="_blank" rel="noopener noreferrer">HDFC QR login instructions</a>}
+      </div>
       <Field label="Customer ID / User ID" htmlFor="browser-customer"
         hint={q.data?.has_customer_id ? 'An encrypted identifier is saved. Leave blank to keep it.' :
           profile.capabilities.customer_id_autofill ? 'Enter once to save encrypted and auto-fill the verified bank login field.' : 'Stored encrypted. Auto-fill requires a reviewed login field.'}>
@@ -100,6 +111,7 @@ export function BrowserBankConnection({ account }: { account: Account }) {
         {canCancel && busy && q.data?.job && <Button variant="outline" onClick={() => cancel.mutate(q.data!.job!.id)}>Close bank session</Button>}
       </div>
       {start.error && <Notice tone="danger">{errorText(start.error)}</Notice>}
+      {qrLogin.error && <Notice tone="danger">{errorText(qrLogin.error)}</Notice>}
     </>}
     {q.data?.job && <div role="status" className="text-sm space-y-1"><StatusBadge status={q.data.job.status} />
       <p>{q.data.job.error || q.data.job.message}</p>

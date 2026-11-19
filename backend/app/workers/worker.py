@@ -64,11 +64,16 @@ def execute_job(job_id: uuid.UUID) -> str:
         db.commit()
         try:
             result = handler(JobContext(db, job))
+            db.refresh(job, attribute_names=["status"])
+            if job.status != "running":
+                raise JobCancelled("Execution stopped because this job is no longer running")
             queue.complete(db, job, result)
             db.commit()
         except Deferred as d:
             db.rollback()
             job = db.get(AutomationJob, job_id)
+            if job.status != "running":
+                return job.status
             if d.state:
                 job.payload = {**(job.payload or {}), **d.state}
             if job.job_type == "collect_account" and job.account_id and job.started_at:
@@ -83,12 +88,15 @@ def execute_job(job_id: uuid.UUID) -> str:
         except JobCancelled:
             db.rollback()
             job = db.get(AutomationJob, job_id)
-            job.status, job.finished_at = "cancelled", queue.now()
-            queue.log(db, job, "info", "Job cancelled during execution")
+            if job.status == "running":
+                job.status, job.finished_at = "cancelled", queue.now()
+            queue.log(db, job, "info", "Execution stopped; existing terminal job status retained")
             db.commit()
         except UserActionRequired as exc:
             db.rollback()
             job = db.get(AutomationJob, job_id)
+            if job.status != "running":
+                return job.status
             attempts_before_wait = job.attempts
             queue.await_user(db, job, action=exc.action, message=str(exc))
             job.error_code = exc.code
@@ -102,6 +110,8 @@ def execute_job(job_id: uuid.UUID) -> str:
         except (ProviderError, PermanentJobError, Exception) as exc:  # noqa: BLE001 - isolation boundary
             db.rollback()
             job = db.get(AutomationJob, job_id)
+            if job.status != "running":
+                return job.status
             retryable = bool(getattr(exc, "retryable", False))
             code = getattr(exc, "code", None) or type(exc).__name__
             message = str(exc) or type(exc).__name__

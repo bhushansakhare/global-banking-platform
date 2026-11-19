@@ -10,6 +10,9 @@ import { Money } from '@/components/Money';
 import { UploadStatementModal } from '@/features/statements/UploadStatementModal';
 import { accountsApi, statementsApi } from '@/services/api';
 import { useAuth } from '@/stores/auth';
+import { useAction } from '@/hooks/useMutationToast';
+import { request } from '@/services/http';
+import { Notice } from '@/components/ui/layout';
 import type { Statement } from '@/types/api';
 import { date, relative } from '@/utils/format';
 
@@ -23,6 +26,10 @@ export default function Statements() {
   const can = useAuth((s) => s.can);
   const account_id = params.get('account_id') ?? '';
   const status = params.get('status') ?? '';
+  const [extractionMessage, setExtractionMessage] = useState('');
+  const extract = useAction(() => request<{ message: string }>('/statements/extract-pending', {
+    method: 'POST', query: account_id ? { account_id } : {},
+  }), { invalidate: [['statements'], ['jobs']], onSuccess: (r) => setExtractionMessage(r.message) });
   const accounts = useQuery({ queryKey: ['accounts'], queryFn: () => accountsApi.list() });
   const list = useQuery({ queryKey: ['statements', account_id, status, page], refetchInterval: 15000,
     queryFn: () => statementsApi.list({ account_id, status, page, page_size: 25 }) });
@@ -47,7 +54,10 @@ export default function Statements() {
   return (
     <>
       <PageHeader eyebrow="Data" title="Statements" subtitle="Downloaded and uploaded statements with extraction status. Originals are stored unchanged and content-hashed for duplicate detection."
-        actions={can('statements:write') && <Button icon={<Upload className="h-4 w-4" />} onClick={() => setUpload(true)}>Upload statement</Button>} />
+        actions={can('statements:write') && <>
+          <Button variant="outline" loading={extract.isPending} onClick={() => extract.mutate(undefined)}>Extract pending statements</Button>
+          <Button icon={<Upload className="h-4 w-4" />} onClick={() => setUpload(true)}>Upload statement</Button></>} />
+      {extractionMessage && <div className="mb-4"><Notice>{extractionMessage}</Notice></div>}
       <Card padded={false}>
         <div className="flex flex-col sm:flex-row gap-3 p-4 border-b border-line">
           <Select aria-label="Account" value={account_id} onChange={(e) => setFilter('account_id', e.target.value)} className="sm:w-72">

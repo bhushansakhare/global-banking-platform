@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 import uuid
+import pytest
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select, text
@@ -86,6 +87,80 @@ def test_stale_job_recovered_after_crash(client, owner):
     with session_scope() as db:
         j = db.get(AutomationJob, jid)
         assert j.status == "retry_scheduled" and j.error_code == "worker_lost"
+
+
+def test_resumed_browser_uses_current_attempt_clock_not_original_start(client, owner):
+    tid = _tenant(owner)
+    with session_scope() as db:
+        job, _ = queue.enqueue(db, tenant_id=tid, job_type="open_bank_login", max_attempts=1)
+        jid = job.id
+    with session_scope() as db:
+        queue.claim(db, "browser-worker", 1)
+        job = db.get(AutomationJob, jid)
+        job.started_at = datetime.now(UTC) - timedelta(days=2)
+    with session_scope() as db:
+        assert queue.recover_stale(db) == 0
+        job = db.get(AutomationJob, jid)
+        assert job.status == "running" and job.error_code is None
+
+
+def test_real_current_attempt_timeout_still_stops_the_job(client, owner):
+    from app.core.config import get_settings
+    tid = _tenant(owner)
+    with session_scope() as db:
+        job, _ = queue.enqueue(db, tenant_id=tid, job_type="open_bank_login", max_attempts=1)
+        jid = job.id
+    with session_scope() as db:
+        queue.claim(db, "browser-worker", 1)
+        job = db.get(AutomationJob, jid)
+        job.locked_at = datetime.now(UTC) - timedelta(seconds=get_settings().job_timeout_seconds + 1)
+    with session_scope() as db:
+        assert queue.recover_stale(db) == 1
+        job = db.get(AutomationJob, jid)
+        assert job.status == "failed" and job.error_code == "job_timeout"
+
+
+def test_terminal_job_heartbeat_cannot_resurrect_the_failed_browser(client, owner):
+    tid = _tenant(owner)
+    with session_scope() as db:
+        job, _ = queue.enqueue(db, tenant_id=tid, job_type="open_bank_login", max_attempts=1)
+        jid = job.id
+    with session_scope() as db:
+        queue.claim(db, "browser-worker", 1)
+        job = db.get(AutomationJob, jid)
+        stamp = job.heartbeat_at
+        job.status, job.error_code = "failed", "job_timeout"
+    with session_scope() as db:
+        assert queue.heartbeat(db, jid, 15, "Waiting for OTP") is True
+        job = db.get(AutomationJob, jid)
+        assert job.status == "failed" and job.error_code == "job_timeout"
+        assert job.heartbeat_at == stamp
+
+
+@pytest.mark.parametrize("outcome", ["success", "user_action", "deferred", "provider_error"])
+def test_worker_does_not_overwrite_timeout_with_a_success_result(client, owner, monkeypatch, outcome):
+    from app.automation.handlers import HANDLERS, Deferred
+    from app.integrations.base.adapter import UserActionRequired, ProviderUnavailable
+    tid = _tenant(owner)
+    def deadline_reached(ctx):
+        ctx.job.status, ctx.job.error_code = "failed", "job_timeout"
+        ctx.db.commit()
+        if outcome == "user_action":
+            raise UserActionRequired("Complete verification", action="reauth")
+        if outcome == "deferred":
+            raise Deferred(30, "Wait for bank")
+        if outcome == "provider_error":
+            raise ProviderUnavailable("Bank unavailable")
+        return {"data_retrieved": True}
+    monkeypatch.setitem(HANDLERS, "timeout_race", deadline_reached)
+    with session_scope() as db:
+        job, _ = queue.enqueue(db, tenant_id=tid, job_type="timeout_race", max_attempts=1)
+        jid = job.id
+    run_pending_once()
+    with session_scope() as db:
+        job = db.get(AutomationJob, jid)
+        assert job.status == "failed" and job.error_code == "job_timeout"
+        assert job.result.get("data_retrieved") is not True
 
 
 def test_scheduler_runs_enabled_accounts_only(client, owner):

@@ -292,3 +292,73 @@ ACCESS_DENIED follow-up:
 - Validation for the denial update: 53 browser-banking backend tests and 6 frontend browser-flow
   tests passed; backend Ruff and the production frontend build passed. The local backend was
   restarted with the new handler without creating any new bank login job.
+
+19 November 2026 startup/OTP-window correction:
+
+- The active backend was running with browser automation disabled. The previous enabled state
+  had only been supplied to a process launch and did not survive a different startup command.
+- Set the three non-secret browser options in `backend/.env`: `BROWSER_AUTOMATION_ENABLED=true`,
+  `BROWSER_CHANNEL=msedge`, `BROWSER_LOGIN_TIMEOUT_SECONDS=600`. All other environment values,
+  existing accounts and encrypted saved logins were retained. `scripts/dev.cmd` now supplies the
+  same development defaults when they are not explicitly set.
+- The timeout setting now has a minimum of 60 seconds. The headed bank window normally waits
+  up to 600 seconds for verification. Customer cancellation, browser closure or an explicit bank
+  rejection can stop it earlier; a bank's own OTP expiry is not extended or bypassed.
+- Browser status and health expose the non-secret enabled/mode/wait values; the account panel
+  displays the configured verification duration. An old configuration-only failure no longer
+  keeps a saved-login account failed after the browser setting is corrected. No sync is fabricated.
+- A visible synthetic OTP page stayed open for **62.5 seconds** using the real browser engine.
+  No real bank account, saved password or OTP was used in that check. Frontend browser tests (7),
+  build and Ruff passed. Backend browser tests had 55 passing cases and one test-fixture setup
+  failure; after correcting the fixture to use the normal job enqueue path, all three new cases
+  passed in a focused run.
+- Restarted the verified backend. Live health returned `bank_browser.enabled: true`,
+  `bank_browser.mode: headed`, `bank_browser.verification_wait_seconds: 600`, with database OK.
+  The Vite frontend on port 5173 returned HTTP 200. No real-bank login was submitted during this fix.
+
+Manual Run now / zero-job correction:
+
+- The customer's saved-login account had `automation_paused=true`. Global Run now used the
+  schedule eligibility filter and silently skipped it. Manual Run now now includes valid saved
+  browser logins regardless of the account's scheduling on/off or paused flags. It does not
+  change those flags or resume scheduled collection.
+- An explicitly user-requested browser job can execute even when organisation scheduling is
+  paused. This exception is limited to jobs tagged `user_requested_browser=true`; scheduled and
+  other background jobs still obey the existing pause rules.
+- Run now reports new, resumed and already-running jobs separately. The frontend displays the
+  returned message rather than treating `jobs_created=0` as a successful zero-job run. With no
+  runnable account, the API returns `no_eligible_accounts` rather than a misleading success toast.
+- Related backend suite: 90 tests passed and one resume-count test failed because the session
+  disables autoflush. Added an explicit flush before run-summary queries; the failed case and
+  all other new pause/count scenarios then passed in a focused six-case run. Frontend automation
+  and browser tests (13), production build and Ruff passed.
+- Loaded the update and performed one explicitly user-requested Run now for the saved account.
+  The result was `jobs_started: 1`, `jobs_resumed: 0`, message `1 bank browser login(s) queued`;
+  the account's scheduling pause remained true. The worker reached `running` / opening official
+  bank login with no error. Successful bank authentication and retrieval are not implied by this.
+
+Post-OTP lifecycle investigation:
+
+- The customer reported being ejected after entering an OTP. The latest job recorded `job_timeout`,
+  with its first `started_at` substantially earlier than the current `locked_at`, and continued
+  receiving worker heartbeats after being marked failed. This establishes a software watchdog
+  issue; it does not establish that the bank rejected the OTP or that authentication succeeded.
+- The watchdog now measures a running attempt from `locked_at` (falling back to `started_at`
+  for legacy data), retaining the original first-start timestamp for history. Resuming an old job
+  no longer consumes its new verification window using time spent in an earlier session.
+- Heartbeats only update running jobs. A terminal/recovered job tells its worker to stop rather
+  than keeping an orphaned bank browser active. A worker cannot complete a terminal job as a
+  successful run, and stopping that worker preserves the previous failure reason.
+- The normal verification wait remains 600 seconds. Real attempt timeouts, explicit cancellation
+  and bank authorization denials remain enforced. These changes do not bypass MFA or extend a
+  bank-issued OTP's validity. No additional real-bank authentication was submitted for this fix.
+# QR / bank app login
+
+Validation: 66 backend browser-banking tests and 8 frontend browser-connection tests passed. QR cases cover sessions with/without saved secrets, rejecting combined QR/password submission, switching active login modes, and continuing a synthetic supported statement workflow. No real bank login or QR approval was submitted during validation.
+
+In **Connection setup → Connect through your bank website**, select the bank profile and press **QR / bank app login**. The software opens a fresh official bank page without loading or submitting saved Customer ID/password. Choose the bank's own QR login option there, scan with its official mobile app and approve on that app. QR images, mPINs, approvals and tokens are not captured or stored by the software.
+
+HDFC documents QR login via the HDFC Bank App, swipe approval and mPIN here: https://www.hdfc.bank.in/resources/way-to-bank/online-banking/net-banking/two-step-verification . Availability/eligibility and session acceptance remain bank-controlled. This option does not bypass a rejected bank session.
+
+For a permitted, reviewed statement workflow, QR authentication uses the same authenticated/account-identity checks and statement pipeline as password login. If the bank profile is unverified (currently HDFC), the button opens a login-only session and never marks it as a successful sync. An existing active password session must be closed before switching to QR. Login-only sessions use the account's configured verification wait; scanning a QR alone is not proof of successful authentication.
+

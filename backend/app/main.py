@@ -117,7 +117,9 @@ def create_app(*, with_lifespan: bool = True) -> FastAPI:
                 c.execute(text("SELECT 1"))
         except Exception:  # noqa: BLE001
             db_ok = False
-        return {"status": "ok" if db_ok else "degraded", "database": db_ok, "version": app.version}
+        return {"status": "ok" if db_ok else "degraded", "database": db_ok, "version": app.version,
+                "bank_browser": {"enabled": s.browser_automation_enabled, "mode": "headed",
+                                 "verification_wait_seconds": s.browser_login_timeout_seconds}}
 
     app.include_router(api)
 

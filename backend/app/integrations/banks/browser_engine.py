@@ -1,6 +1,7 @@
 """Visible, ephemeral Playwright sessions. Secrets are entered only on the bank page.
 
-No tracing, screenshots, storage-state exports, payload logging or private API integrations.
+No tracing, authentication screenshots, storage-state exports, payload logging or private API integrations.
+Optional statement-screen images are captured only after account confirmation and validated download.
 Every Playwright object is created and disposed on the worker thread that owns it.
 """
 from __future__ import annotations
@@ -267,7 +268,7 @@ def confirm_account(page, profile: BrowserProfile, masked_number: str) -> None:
 
 def retrieve(profile: BrowserProfile, *, customer_id: str, masked_number: str,
              date_from: date, date_to: date, progress, login_only: bool = False, password: str = "",
-             on_review=None) -> list[tuple[str, bytes]]:
+    on_review=None, verification_wait_seconds: int | None = None, on_statement_screenshot=None) -> list[tuple[str, bytes]]:
     settings = get_settings()
     if not settings.browser_automation_enabled:
         raise ConfigurationMissing("Set BROWSER_AUTOMATION_ENABLED=true on the local Windows desktop")
@@ -305,7 +306,10 @@ def retrieve(profile: BrowserProfile, *, customer_id: str, masked_number: str,
                     progress(15, "Bank login submitted; complete OTP, CAPTCHA or app approval on the bank page")
                 else:
                     autofill_customer_id(page, profile, customer_id)
-                deadline = time.monotonic() + settings.browser_login_timeout_seconds
+                wait_seconds = verification_wait_seconds if verification_wait_seconds is not None else settings.browser_login_timeout_seconds
+                if not 60 <= wait_seconds <= 720:
+                    raise ConfigurationMissing("Bank verification wait must be between 60 and 720 seconds")
+                deadline = time.monotonic() + wait_seconds
                 last_review_time, previous_review = 0.0, None
                 while time.monotonic() < deadline:
                     if blocked[0]:
@@ -330,7 +334,8 @@ def retrieve(profile: BrowserProfile, *, customer_id: str, masked_number: str,
                                 previous_review = evidence
                         except Error:
                             pass  # the customer may be navigating between bank pages
-                    progress(15, "Waiting for authentication on the official bank page")
+                    remaining = max(0, int(deadline - time.monotonic()))
+                    progress(15, f"Waiting for authentication on the official bank page ({remaining}s remaining)")
                     page.wait_for_timeout(1000)
                 else:
                     raise UserActionRequired("Bank login timed out; open the bank browser again", action="reauth")
@@ -374,6 +379,16 @@ def retrieve(profile: BrowserProfile, *, customer_id: str, masked_number: str,
                 name = Path(download.suggested_filename).name
                 validate_download(content, name, profile.formats)
                 files.append((name, content))
+                if on_statement_screenshot:
+                    # Capture only a confirmed account's statement screen, never an authentication form.
+                    confirm_account(page, profile, masked_number)
+                    check_bank_access(page, access_state)
+                    if page.locator('input[type="password"]:visible, input[autocomplete="one-time-code"]:visible').count() == 0:
+                        try:
+                            on_statement_screenshot(page.screenshot(type="png", full_page=False,
+                                mask=[page.locator('input, textarea, [contenteditable="true"]')]))
+                        except Error:
+                            progress(74, "Statement downloaded; optional bank screen image unavailable")
                 if profile.logout_selector and visible(page, profile.logout_selector):
                     page.locator(profile.logout_selector).click()
                 progress(75, "Statement downloaded and validated")

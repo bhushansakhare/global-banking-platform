@@ -217,6 +217,7 @@ export interface Statement {
   file: { original_filename: string; format: string; size_bytes: number; sha256: string; scanned: boolean | null;
     page_count: number | null } | null;
   institution?: string;
+  bank_screenshot_available?: boolean;
   parsing_jobs?: {
     id: UUID; status: string; parser_name: string | null; rows_extracted: number; rows_inserted: number;
     rows_duplicate: number; started_at: string | null; finished_at: string | null; error: string | null;

@@ -13,7 +13,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -73,7 +73,8 @@ _CLAIM_SQL = text("""
         WHERE j.status IN ('queued','retry_scheduled')
           AND j.run_after <= now()
           AND j.cancel_requested = false
-          AND COALESCE(s.paused, false) = false
+          AND (COALESCE(s.paused, false) = false OR
+               (j.trigger = 'manual' AND j.payload->>'user_requested_browser' = 'true'))
         ORDER BY j.priority, j.run_after
         FOR UPDATE OF j SKIP LOCKED
         LIMIT :limit
@@ -106,8 +107,10 @@ def heartbeat(db: Session, job_id: uuid.UUID, progress: int | None = None, messa
         vals["progress"] = max(0, min(100, progress))
     if message is not None:
         vals["progress_message"] = message[:255]
-    db.execute(update(AutomationJob).where(AutomationJob.id == job_id).values(**vals))
-    return bool(db.scalar(select(AutomationJob.cancel_requested).where(AutomationJob.id == job_id)))
+    row = db.execute(update(AutomationJob).where(AutomationJob.id == job_id, AutomationJob.status == "running")
+                     .values(**vals).returning(AutomationJob.cancel_requested)).first()
+    # A recovered/timed-out job must not keep driving an orphaned browser or resurrect its heartbeat.
+    return row is None or bool(row[0])
 
 
 def complete(db: Session, job: AutomationJob, result: dict[str, Any]) -> None:
@@ -163,10 +166,12 @@ def recover_stale(db: Session) -> int:
     hard_timeout = now() - timedelta(seconds=s.job_timeout_seconds)
     stale = db.scalars(select(AutomationJob).where(
         AutomationJob.status == "running",
-        (AutomationJob.heartbeat_at < cutoff) | (AutomationJob.started_at < hard_timeout))
+        (AutomationJob.heartbeat_at < cutoff) |
+        (func.coalesce(AutomationJob.locked_at, AutomationJob.started_at) < hard_timeout))
         .with_for_update(skip_locked=True)).all()
     for job in stale:
-        timed_out = job.started_at is not None and job.started_at < hard_timeout
+        attempt_started = job.locked_at or job.started_at
+        timed_out = attempt_started is not None and attempt_started < hard_timeout
         fail(db, job, code="job_timeout" if timed_out else "worker_lost",
              message="Job exceeded its timeout" if timed_out else "Worker stopped responding; job recovered",
              retryable=True, base_delay=30)

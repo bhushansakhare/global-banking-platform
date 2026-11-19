@@ -17,6 +17,7 @@ export interface BrowserProfile {
 }
 export interface BrowserStatus {
   enabled: boolean; profile_key: string | null; has_customer_id: boolean; has_password?: boolean; profiles: BrowserProfile[];
+  browser_mode?: 'headed'; verification_wait_seconds?: number;
   job: { id: string; status: string; message: string | null; error: string | null; result: Record<string, unknown>;
     error_code?: string | null; requires_user_action?: string | null } | null;
 }
@@ -27,7 +28,7 @@ export const browserBankingApi = {
   saveLogin: (id: string, body: { profile_key: string; customer_id: string; password?: string }) =>
     request<{ saved: boolean; has_customer_id: boolean; has_password: boolean }>(`/accounts/${id}/browser/credentials`, { method: 'PUT', body }),
   forgetLogin: (id: string) => request<{ saved: boolean }>(`/accounts/${id}/browser/credentials`, { method: 'DELETE' }),
-  start: (id: string, body: { profile_key: string; customer_id?: string; login_only: boolean; date_from?: string; date_to?: string; authenticate?: boolean }) =>
+  start: (id: string, body: { profile_key: string; customer_id?: string; login_only: boolean; date_from?: string; date_to?: string; authenticate?: boolean; qr_login?: boolean }) =>
     request<{ job_id: string; created: boolean; status: string }>(`/accounts/${id}/browser/start`, { method: 'POST', body }),
 };
 
@@ -80,7 +81,7 @@ export const accountsApi = {
   list: (q: Q = {}) => request<Account[]>('/accounts', { query: q }),
   get: (id: string) => request<Account>(`/accounts/${id}`),
   create: (b: AccountInput) => request<Account>('/accounts', { method: 'POST', body: b }),
-  update: (id: string, b: Omit<Partial<AccountInput>, 'sync_schedule'> & { timezone?: string; sync_schedule?: string | null }) =>
+  update: (id: string, b: Omit<Partial<AccountInput>, 'sync_schedule' | 'low_balance_threshold'> & { timezone?: string; sync_schedule?: string | null; low_balance_threshold?: string | null }) =>
     request<Account>(`/accounts/${id}`, { method: 'PATCH', body: b }),
   remove: (id: string) => request<void>(`/accounts/${id}`, { method: 'DELETE' }),
   setAutomation: (id: string, enabled: boolean) =>
@@ -181,7 +182,8 @@ export const automationApi = {
   pause: () => request<AutomationSettings>('/automation/pause', { method: 'POST' }),
   resume: () => request<AutomationSettings>('/automation/resume', { method: 'POST' }),
   runNow: (account_ids?: string[]) =>
-    request<{ run_id: string; jobs_created: number }>('/automation/run-now', { method: 'POST', body: { account_ids } }),
+    request<{ run_id: string; jobs_created: number; jobs_resumed?: number; jobs_started?: number;
+      already_in_progress?: number; message?: string }>('/automation/run-now', { method: 'POST', body: { account_ids } }),
   retryFailed: () => request<{ requeued: number }>('/automation/retry-failed', { method: 'POST' }),
   jobs: (q: Q = {}) => request<Page<Job>>('/jobs', { query: q }),
   job: (id: string) => request<JobDetail>(`/jobs/${id}`),

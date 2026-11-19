@@ -89,9 +89,11 @@ def start_run(db: Session, s: AutomationSettings, *, trigger: str, slot: datetim
     accounts = eligible_accounts(db, s.tenant_id, own_schedule=False if trigger == "schedule" else None)
     if trigger == "manual":
         seen = {a.id for a in accounts}
-        for account in manual_accounts(db, s.tenant_id):
-            if account.id not in seen and account.browser_identifier_encrypted and account.automation_enabled \
-                    and not account.automation_paused:
+        saved_accounts = db.scalars(select(BankAccount).where(BankAccount.tenant_id == s.tenant_id,
+            BankAccount.deleted_at.is_(None), BankAccount.browser_identifier_encrypted.is_not(None)))
+        for account in saved_accounts:
+            # Run now is an explicit one-off request; scheduling switches must not silently skip it.
+            if account.id not in seen:
                 from app.automation.browser_jobs import saved_login_profile
                 if saved_login_profile(db, account):
                     accounts.append(account)

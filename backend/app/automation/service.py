@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session
 
 from app.audit.service import record as audit
@@ -103,9 +103,28 @@ def run_now(db: Session, tenant_id: uuid.UUID, user_id: uuid.UUID, account_ids: 
             n += int(new)
     else:
         run_id, n = start_run(db, s, trigger="manual", slot=slot.replace(microsecond=0), user_id=user_id)
+    db.flush()  # resumed jobs change run_id/status in a session with autoflush disabled
+    run_jobs = list(db.scalars(select(AutomationJob).where(AutomationJob.tenant_id == tenant_id,
+        AutomationJob.run_id == run_id, AutomationJob.job_type.in_(("collect_account", "open_bank_login")))))
+    resumed = max(0, len(run_jobs) - n)
+    started = n + resumed
+    active_query = select(func.count()).select_from(AutomationJob).where(AutomationJob.tenant_id == tenant_id,
+        AutomationJob.job_type.in_(("collect_account", "open_bank_login")),
+        AutomationJob.status.in_(("queued", "running", "retry_scheduled")))
+    if account_ids:
+        active_query = active_query.where(AutomationJob.account_id.in_(account_ids))
+    existing = max(0, (db.scalar(active_query) or 0) - started)
+    if started:
+        browser_count = sum(j.job_type == "open_bank_login" or bool(j.payload.get("authenticate")) for j in run_jobs)
+        message = f"{browser_count} bank browser login(s) queued" if browser_count else f"{started} collection job(s) queued"
+    elif existing:
+        message = "A bank run is already queued or running; another browser was not opened"
+    else:
+        raise Conflict("No runnable bank account found. Save a bank login or select a configured account.", code="no_eligible_accounts")
     audit(db, action="automation.run_now", tenant_id=tenant_id, actor_user_id=user_id, entity_type="automation_run",
           entity_id=run_id, meta={"jobs": n, "accounts": [str(a) for a in account_ids or []]})
-    return {"run_id": str(run_id), "jobs_created": n}
+    return {"run_id": str(run_id), "jobs_created": n, "jobs_resumed": resumed, "jobs_started": started,
+            "already_in_progress": existing, "message": message}
 
 
 def _job(db: Session, tenant_id: uuid.UUID, job_id: uuid.UUID) -> AutomationJob:

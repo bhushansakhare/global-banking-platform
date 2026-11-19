@@ -642,6 +642,53 @@ def test_worker_uses_password_only_for_requested_authentication(client, owner, b
     assert calls[-1]["password"] == "SYNTHETIC-PASSWORD"
 
 
+@pytest.mark.parametrize('saved', [False, True])
+def test_qr_login_never_loads_or_submits_saved_credentials(client, owner, browser_enabled, monkeypatch, saved):
+    account = _hdfc_manual_account(client)
+    if saved:
+        save_hdfc_login(client, account)
+    calls = []
+    monkeypatch.setattr(browser_jobs, 'retrieve', lambda *a, **kw: calls.append(kw) or [])
+    def no_decryption(*args):
+        raise AssertionError('QR worker must not decrypt saved bank credentials')
+    monkeypatch.setattr(browser_jobs, 'decrypt_json', no_decryption)
+    result = client.post(f"/api/v1/accounts/{account['id']}/browser/start", json={
+        'profile_key': 'hdfc_bank', 'login_only': True, 'qr_login': True})
+    assert result.status_code == 202, result.text
+    run_pending_once()
+    assert calls[0]['password'] == '' and calls[0]['customer_id'] == ''
+    with session_scope() as db:
+        job = db.get(AutomationJob, uuid.UUID(result.json()['job_id']))
+        assert job.status == 'succeeded' and job.result['data_retrieved'] is False
+        assert db.get(BankAccount, uuid.UUID(account['id'])).last_successful_sync_at is None
+
+
+def test_qr_login_rejects_password_submission_and_switching_an_active_session(client, owner, browser_enabled):
+    account = _hdfc_manual_account(client)
+    url = f"/api/v1/accounts/{account['id']}/browser/start"
+    base = {'profile_key': 'hdfc_bank', 'login_only': True, 'qr_login': True}
+    assert client.post(url, json={**base, 'authenticate': True}).status_code == 422
+    assert client.post(url, json={**base, 'customer_id': 'CUSTOMER'}).status_code == 422
+    assert client.post(url, json=base).status_code == 202
+    assert client.post(url, json={**base, 'qr_login': False}).status_code == 409
+
+
+def test_qr_approved_supported_workflow_can_continue_to_statement_pipeline(client, owner, browser_enabled, monkeypatch):
+    account = _hdfc_manual_account(client)
+    assert client.put('/api/v1/banks/browser-profiles/example_bank', json=permitted_profile()).status_code == 200
+    calls = []
+    monkeypatch.setattr(browser_jobs, 'retrieve', lambda *a, **kw: calls.append(kw) or [('statement.csv', CSV)])
+    response = client.post(f"/api/v1/accounts/{account['id']}/browser/start", json={
+        'profile_key': 'example_bank', 'login_only': False, 'qr_login': True})
+    assert response.status_code == 202, response.text
+    run_pending_once()
+    assert calls[0]['password'] == '' and calls[0]['customer_id'] == '' and calls[0]['login_only'] is False
+    with session_scope() as db:
+        job = db.get(AutomationJob, uuid.UUID(response.json()['job_id']))
+        assert job.status == 'succeeded' and job.result['data_retrieved'] is True
+        assert job.result['statements_new'] == 1
+
+
 def test_saved_password_cannot_be_filled_into_a_text_field():
     from app.integrations.banks.browser_engine import submit_saved_login
     page, customer, password = Mock(), Mock(), Mock()
@@ -718,3 +765,93 @@ def test_saved_login_run_now_prevents_duplicate_browser_jobs(client, owner, brow
     assert first.status_code == second.status_code == 202
     assert first.json()["job_id"] == second.json()["job_id"]
     assert second.json()["created"] is False
+
+
+def test_otp_wait_configuration_rejects_less_than_sixty_seconds():
+    from app.core.config import Settings
+    with pytest.raises(ValidationError):
+        Settings(browser_login_timeout_seconds=59)
+    assert Settings(browser_login_timeout_seconds=60).browser_login_timeout_seconds == 60
+
+
+def test_browser_status_reports_headed_mode_and_otp_wait(client, owner, browser_enabled):
+    account = _hdfc_manual_account(client)
+    status = client.get(f"/api/v1/accounts/{account['id']}/browser").json()
+    assert status["enabled"] is True and status["browser_mode"] == "headed"
+    assert status["verification_wait_seconds"] >= 60
+    health = client.get("/api/v1/health").json()
+    assert health["bank_browser"]["enabled"] is True
+    assert health["bank_browser"]["verification_wait_seconds"] >= 60
+
+
+def test_enabling_browser_resolves_old_configuration_failure_without_faking_sync(client, owner, browser_enabled):
+    account = _hdfc_manual_account(client)
+    save_hdfc_login(client, account)
+    with session_scope() as db:
+        from app.automation import queue
+        acc = db.get(BankAccount, uuid.UUID(account["id"]))
+        job, _ = queue.enqueue(db, tenant_id=acc.tenant_id, account_id=acc.id, job_type="open_bank_login", trigger="manual")
+        job.status, job.error_code = "failed", "provider_not_configured"
+        job.error_message = "Set BROWSER_AUTOMATION_ENABLED=true"
+    current = client.get(f"/api/v1/accounts/{account['id']}").json()
+    assert current["automation"]["status"] == "ready"
+    assert current["last_successful_sync_at"] is None
+
+
+@pytest.mark.parametrize("disabled,account_paused,organisation_paused", [(False, True, False), (True, False, False), (False, True, True)])
+def test_manual_run_now_opens_saved_bank_even_when_schedules_are_paused(client, owner, browser_enabled, monkeypatch,
+                                                                      disabled, account_paused, organisation_paused):
+    account = _hdfc_manual_account(client)
+    save_hdfc_login(client, account)
+    with session_scope() as db:
+        acc = db.get(BankAccount, uuid.UUID(account["id"]))
+        acc.automation_enabled, acc.automation_paused = not disabled, account_paused
+    if organisation_paused:
+        assert client.post("/api/v1/automation/pause").status_code == 200
+    calls = []
+    monkeypatch.setattr(browser_jobs, "retrieve", lambda *a, **kw: calls.append(kw) or [])
+    result = client.post("/api/v1/automation/run-now", json={})
+    assert result.status_code == 202, result.text
+    assert result.json()["jobs_started"] == 1
+    assert result.json()["message"] == "1 bank browser login(s) queued"
+    run_pending_once()
+    assert len(calls) == 1 and calls[0]["password"] == "SYNTHETIC-PASSWORD"
+    current = client.get(f"/api/v1/accounts/{account['id']}").json()
+    assert current["automation_paused"] == account_paused
+    assert current["automation_enabled"] == (not disabled)
+    assert current["last_successful_sync_at"] is None
+
+
+def test_resumed_browser_run_reports_started_instead_of_zero_collection_jobs(client, owner, browser_enabled):
+    account = _hdfc_manual_account(client)
+    save_hdfc_login(client, account)
+    first = client.post("/api/v1/automation/run-now", json={})
+    assert first.status_code == 202
+    with session_scope() as db:
+        job = db.scalar(select(AutomationJob).where(AutomationJob.account_id == uuid.UUID(account["id"])))
+        original = job.id
+        job.status, job.requires_user_action = "awaiting_user", "reauth"
+    second = client.post("/api/v1/automation/run-now", json={})
+    assert second.status_code == 202, second.text
+    assert second.json()["jobs_created"] == 0
+    assert second.json()["jobs_resumed"] == second.json()["jobs_started"] == 1
+    assert second.json()["message"] == "1 bank browser login(s) queued"
+    with session_scope() as db:
+        job = db.get(AutomationJob, original)
+        assert job.status == "queued"
+
+
+def test_already_queued_browser_has_clear_message_without_duplicate(client, owner, browser_enabled):
+    account = _hdfc_manual_account(client)
+    save_hdfc_login(client, account)
+    client.post("/api/v1/automation/run-now", json={})
+    second = client.post("/api/v1/automation/run-now", json={})
+    assert second.status_code == 202
+    assert second.json()["already_in_progress"] == 1
+    assert "already queued or running" in second.json()["message"]
+
+
+def test_empty_run_now_reports_no_eligible_account_instead_of_success_zero(client, owner):
+    result = client.post("/api/v1/automation/run-now", json={})
+    assert result.status_code == 409
+    assert result.json()["error"]["code"] == "no_eligible_accounts"

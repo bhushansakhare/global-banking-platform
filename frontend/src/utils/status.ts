@@ -62,4 +62,6 @@ export const JOB_LABELS: Record<string, string> = {
   collect_account: 'Bank collection', parse_statement: 'Statement extraction', reconcile_account: 'Reconciliation',
   daily_report: 'Daily report',
   open_bank_login: 'Official bank login',
+  low_balance_email: 'Low-balance email',
+  balance_email: 'Account balance email',
 };

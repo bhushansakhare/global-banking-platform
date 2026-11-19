@@ -10,6 +10,7 @@ import re
 from typing import Any
 
 import fitz
+from app.core.config import get_settings
 
 from app.statements.normalize import NormalizedStatement, detect_header, normalize_table
 from app.statements.parsers.base import ParseInput, ParserUnavailable, StatementParser
@@ -34,8 +35,21 @@ class PdfParser(StatementParser):
                     raise ParserUnavailable("PDF is password protected", status="needs_review")
             text_chars = sum(len(p.get_text("text").strip()) for p in doc)
             if text_chars < 30:
-                raise ParserUnavailable("PDF appears to be scanned; OCR with manual verification is required",
-                                        status="needs_ocr")
+                # Optional local OCR. No document is sent to an external service.
+                try:
+                    texts = []
+                    for page in doc:
+                        textpage = page.get_textpage_ocr(language="eng", dpi=200, full=True,
+                            tessdata=str(get_settings().ocr_tessdata_dir))
+                        texts.append(page.get_text("text", textpage=textpage))
+                    result = self._lines(doc, data, page_texts=texts)
+                    if not result.rows:
+                        raise ValueError("No reliable OCR transactions")
+                    result.warn("local_ocr", "Extracted with local OCR; verify figures against the original statement")
+                    return result
+                except Exception:
+                    raise ParserUnavailable("Scanned PDF needs local Tesseract OCR and manual verification",
+                                            status="needs_ocr") from None
             table_rows = self._tables(doc)
             if table_rows and detect_header(table_rows):
                 result = normalize_table(table_rows, account_currency=data.account_currency)
@@ -64,13 +78,14 @@ class PdfParser(StatementParser):
                     rows.extend(extracted[start:])
         return rows
 
-    def _lines(self, doc: fitz.Document, data: ParseInput) -> NormalizedStatement:
+    def _lines(self, doc: fitz.Document, data: ParseInput, *, page_texts=None) -> NormalizedStatement:
         """Fallback: Date  Description  [Debit/Amount]  [Credit]  Balance — the last amount is the balance."""
         header = ["Date", "Description", "Amount", "Balance"]
         rows: list[list[Any]] = [header]
         pre: list[list[Any]] = []
-        for page in doc:
-            for line in page.get_text("text").splitlines():
+        texts = page_texts if page_texts is not None else (page.get_text("text") for page in doc)
+        for text in texts:
+            for line in text.splitlines():
                 line = line.strip()
                 m = _LINE_DATE.match(line)
                 if not m:

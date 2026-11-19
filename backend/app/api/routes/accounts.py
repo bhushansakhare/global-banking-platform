@@ -29,6 +29,34 @@ from app.services import connections as conn_svc
 
 router = APIRouter(tags=["accounts"])
 
+from app.services.monitoring import MonitoringSettings, MonitoringUpdate  # noqa: E402
+
+
+@router.get("/accounts/{account_id}/monitoring")
+def get_monitoring(account_id: uuid.UUID, db: DB, p: Principal = require("accounts:read")) -> dict:
+    from app.services.monitoring import settings_for, mail_ready
+    account = banking.get_account(db, p.tenant_id, account_id)
+    return {**settings_for(db, account).model_dump(), "email_configured": mail_ready()}
+
+
+@router.put("/accounts/{account_id}/monitoring")
+def update_monitoring(account_id: uuid.UUID, body: MonitoringUpdate, db: DB,
+                      p: Principal = require("accounts:write")) -> dict:
+    from app.services.monitoring import save_settings, mail_ready
+    account = banking.get_account(db, p.tenant_id, account_id)
+    settings = MonitoringSettings.model_validate(body.model_dump(exclude={"low_balance_threshold"}))
+    save_settings(db, account, settings, p.user_id)
+    if "low_balance_threshold" in body.model_fields_set:
+        account.low_balance_threshold = body.low_balance_threshold
+    if settings.email_enabled and account.low_balance_threshold is None:
+        raise ValidationFailed("Set this account's minimum balance target before enabling balance emails")
+    db.flush()
+    from app.balances.service import check_low_balance
+    check_low_balance(db, account)
+    audit(db, action="account.monitoring.update", tenant_id=p.tenant_id, actor_user_id=p.user_id,
+          entity_type="bank_account", entity_id=account.id, after=body.model_dump(mode="json"), ip=p.ip)
+    return {**settings.model_dump(), "email_configured": mail_ready()}
+
 
 @router.get("/accounts")
 def list_accounts(db: DB, p: Principal = require("accounts:read"), q: str | None = Query(None, max_length=100),

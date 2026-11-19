@@ -78,7 +78,8 @@ export default function Automation() {
     success: (s) => (s.master_enabled ? 'Automation switched on' : 'Automation switched off'), onSuccess: () => setConfirmOff(false) });
   const pause = useAction(() => automationApi.pause(), { invalidate: inv, success: 'Automation paused' });
   const resume = useAction(() => automationApi.resume(), { invalidate: inv, success: 'Automation resumed' });
-  const runNow = useAction((ids?: string[]) => automationApi.runNow(ids), { invalidate: inv, success: (r) => `${r.jobs_created} collection job(s) queued` });
+  const runNow = useAction((ids?: string[]) => automationApi.runNow(ids), { invalidate: inv,
+    success: (r) => r.message ?? (r.jobs_created ? `${r.jobs_created} collection job(s) queued` : 'A bank run is already in progress') });
   const retryAll = useAction(() => automationApi.retryFailed(), { invalidate: inv, success: (r) => `${r.requeued} job(s) re-queued` });
   const accAction = useAction(({ id, a }: { id: string; a: 'enable' | 'pause' | 'resume' | 'disable' }) => accountsApi.automationAction(id, a),
     { invalidate: inv, success: 'Account automation updated' });
@@ -128,7 +129,7 @@ export default function Automation() {
                   <div className="flex flex-wrap items-center gap-2"><h2 className="text-lg font-semibold text-ink">Master automation</h2>
                     <Badge tone={on ? (s.paused ? 'warning' : 'success') : 'neutral'} dot>{on ? (s.paused ? 'Paused' : 'On') : 'Off'}</Badge></div>
                   <p className="text-[13px] text-muted mt-0.5">
-                    {on ? (s.paused ? 'Queued jobs are held until you resume.' : `Next run ${s.next_run_at ? dateTime(s.next_run_at) : '—'} (${s.timezone}). Last run ${relative(s.last_run_at)}.`)
+                    {on ? (s.paused ? 'Scheduled jobs are paused. Saved bank logins can still be run manually.' : `Next run ${s.next_run_at ? dateTime(s.next_run_at) : '—'} (${s.timezone}). Last run ${relative(s.last_run_at)}.`)
                       : 'No scheduled collection will run. Manual runs are still available.'}
                   </p>
                 </div>

@@ -10,6 +10,8 @@ import { Money } from '@/components/Money';
 import { AddAccountModal } from '@/features/accounts/AddAccountModal';
 import { AutomationActions, AutomationStatusBadge } from '@/features/accounts/AutomationControls';
 import { ConnectionSetupModal } from '@/features/accounts/ConnectionSetupModal';
+import { MonitoringControls } from '@/features/accounts/MonitoringControls';
+import { Modal } from '@/components/ui/Modal';
 import { UploadStatementModal } from '@/features/statements/UploadStatementModal';
 import { useDebounce } from '@/hooks/useDebounce';
 import { accountsApi } from '@/services/api';
@@ -31,6 +33,7 @@ export default function Accounts() {
   const [health, setHealth] = useState('');
   const [upload, setUpload] = useState(false);
   const [connect, setConnect] = useState<Account | null>(null);
+  const [monitoring, setMonitoring] = useState<Account | null>(null);
   const navigate = useNavigate();
   const can = useAuth((s) => s.can);
   const dq = useDebounce(q);
@@ -51,6 +54,15 @@ export default function Accounts() {
         <div className="text-[11px] text-muted">{BALANCE_LABELS[b.balance_type]} · {relative(b.as_of)}</div></div>
         : <span className="text-muted text-[13px]">No balance yet</span>;
     } },
+    { key: 'target', header: 'Balance target', mobile: 'meta', cell: (a) => (
+      <div onClick={(e) => e.stopPropagation()}>
+        {a.low_balance_threshold != null
+          ? <Money value={a.low_balance_threshold} currency={a.currency} />
+          : <span className="text-sm text-muted">Not set</span>}
+        <div className="mt-1"><Button size="sm" variant="outline" onClick={() => setMonitoring(a)}>
+          {can('accounts:write') ? 'Set balance target' : 'View balance target'}
+        </Button></div>
+      </div>) },
     { key: 'country', header: 'Country · currency', cell: (a) => <span className="text-[13px]">{a.country_code} · {a.currency}</span> },
     { key: 'method', header: 'Connection method', cell: (a) => <div className="flex flex-col gap-1 items-start">
       <span className="text-[13px] text-ink">{METHOD_LABELS[a.connection?.connection_method ?? ''] ?? a.connection?.provider_name ?? '—'}</span>
@@ -101,6 +113,9 @@ export default function Accounts() {
         onCreated={(a) => navigate(`/accounts/${a.id}${a.automation?.action_required ? '?connect=1' : ''}`)} />
       <UploadStatementModal open={upload} onClose={() => setUpload(false)} />
       {connect && <ConnectionSetupModal account={connect} open={!!connect} onClose={() => setConnect(null)} />}
+      {monitoring && <Modal open onClose={() => setMonitoring(null)} title={`Balance target — ${monitoring.nickname}`} size="xl">
+        <MonitoringControls account={list.data?.find((a) => a.id === monitoring.id) ?? monitoring} editable={can('accounts:write')} />
+      </Modal>}
     </>
   );
 }

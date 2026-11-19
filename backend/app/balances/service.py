@@ -5,7 +5,7 @@ import uuid
 from datetime import UTC, date, datetime
 from decimal import Decimal
 
-from sqlalchemy import and_, func, select
+from sqlalchemy import String, and_, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -89,14 +89,28 @@ def convert(db: Session, tenant_id: uuid.UUID, amount: Decimal, base: str, quote
     return None, None
 
 
+def alert_balance(db: Session, account: BankAccount) -> AccountBalance | None:
+    latest = [b for b in latest_balances(db, account.tenant_id, [account.id])
+              if b.balance_type in ("available", "ledger", "current", "statement_closing")
+              and b.source in ("provider", "statement", "demo")]
+    from app.models.statements import Statement
+    # Only arithmetically validated statements can drive automatic financial alerts.
+    latest = [b for b in latest if b.balance_type != "statement_closing" or db.scalar(
+        select(Statement.id).where(Statement.tenant_id == account.tenant_id,
+            Statement.account_id == account.id, Statement.id.cast(String) == b.source_ref,
+            Statement.deleted_at.is_(None), Statement.processing_status.in_(("processed", "processed_with_warnings")),
+            Statement.arithmetic_valid.is_(True))) is not None]
+    if not latest:
+        return None
+    return max(latest, key=lambda x: (x.as_of, -("available", "current", "ledger", "statement_closing").index(x.balance_type)))
+
+
 def check_low_balance(db: Session, account: BankAccount) -> None:
     if account.low_balance_threshold is None:
         return
-    latest = [b for b in latest_balances(db, account.tenant_id, [account.id])
-              if b.balance_type in ("available", "ledger", "current")]
-    if not latest:
+    b = alert_balance(db, account)
+    if b is None:
         return
-    b = min(latest, key=lambda x: ("available", "current", "ledger").index(x.balance_type))
     if b.amount < account.low_balance_threshold:
         notify(db, tenant_id=account.tenant_id, type="low_balance", severity="warning",
                title=f"Low balance on {account.nickname}",
@@ -104,3 +118,9 @@ def check_low_balance(db: Session, account: BankAccount) -> None:
                     f"{account.low_balance_threshold:,.2f}.",
                link=f"/accounts/{account.id}", entity_type="bank_account", entity_id=account.id,
                dedupe_key=f"low_balance:{account.id}:{b.as_of.date()}")
+    from app.services.monitoring import settings_for
+    if not account.is_demo and settings_for(db, account).email_enabled:
+        from app.automation.queue import enqueue
+        enqueue(db, tenant_id=account.tenant_id, account_id=account.id, job_type="balance_email",
+                payload={"balance_id": str(b.id)}, trigger="pipeline", priority=60,
+                idempotency_key=f"balance-email:{account.id}:{b.id}:{account.low_balance_threshold}")

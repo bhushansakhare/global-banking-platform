@@ -79,6 +79,31 @@ async def upload(db: DB, account_id: uuid.UUID = Form(...), file: UploadFile = F
     return {"duplicate": False, "statement": S.statement(st, acc.nickname)}
 
 
+@router.post("/extract-pending", status_code=202, summary="Queue extraction of pending or unresolved statements")
+def extract_pending(db: DB, p: Principal = require("statements:write"), account_id: uuid.UUID | None = None) -> dict:
+    from app.models.automation import AutomationJob
+    query = select(Statement).where(Statement.tenant_id == p.tenant_id, Statement.deleted_at.is_(None),
+        Statement.processing_status.in_(("pending", "failed", "needs_ocr", "needs_review")))
+    if account_id:
+        get_account(db, p.tenant_id, account_id)
+        query = query.where(Statement.account_id == account_id)
+    statements = db.scalars(query.order_by(Statement.created_at).limit(500).with_for_update(of=Statement)).all()
+    queued = active = 0
+    for st in statements:
+        running = db.scalar(select(AutomationJob.id).where(AutomationJob.tenant_id == p.tenant_id,
+            AutomationJob.job_type == "parse_statement", AutomationJob.payload["statement_id"].astext == str(st.id),
+            AutomationJob.status.in_(queue.ACTIVE_STATES)).limit(1))
+        if running:
+            active += 1
+            continue
+        queue.enqueue(db, tenant_id=p.tenant_id, job_type="parse_statement", account_id=st.account_id,
+                      payload={"statement_id": str(st.id)}, trigger="manual", created_by=p.user_id,
+                      max_attempts=1, priority=50)
+        queued += 1
+    return {"jobs_queued": queued, "already_in_progress": active,
+            "message": f"{queued} statement extraction job(s) queued; {active} already in progress. Up to 500 per request."}
+
+
 @router.get("/{statement_id}")
 def get_statement(statement_id: uuid.UUID, db: DB, p: Principal = require("statements:read")) -> dict:
     st = _get(db, p.tenant_id, statement_id)
@@ -92,6 +117,9 @@ def get_statement(statement_id: uuid.UUID, db: DB, p: Principal = require("state
                             "finished_at": j.finished_at, "error": j.error, "diagnostics": j.diagnostics}
                            for j in jobs]
     out["institution"] = acc.institution.name if acc else None
+    from app.models.system import SystemSetting
+    out["bank_screenshot_available"] = db.scalar(select(SystemSetting.id).where(
+        SystemSetting.tenant_id == p.tenant_id, SystemSetting.key == f"statement_evidence:{st.id}")) is not None
     return out
 
 
@@ -118,6 +146,53 @@ def download_file(statement_id: uuid.UUID, db: DB, p: Principal = require("state
     return FileResponse(path, media_type=st.file.mime_type or "application/octet-stream",
                         filename=st.file.original_filename, content_disposition_type=disp,
                         headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
+
+
+@router.get("/{statement_id}/screenshot", summary="Statement page image or captured bank statement screen")
+def statement_screenshot(statement_id: uuid.UUID, db: DB, p: Principal = require("statements:read"),
+                         page: int = Query(1, ge=1), source: str = Query("statement", pattern="^(statement|bank)$")):
+    st = _get(db, p.tenant_id, statement_id)
+    from app.models.system import SystemSetting
+    headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+    if source == "bank":
+        evidence = db.scalar(select(SystemSetting).where(SystemSetting.tenant_id == p.tenant_id,
+            SystemSetting.key == f"statement_evidence:{st.id}"))
+        if evidence is None:
+            raise NotFound("No bank screenshot was captured for this statement")
+        path = storage.resolve("bank_evidence", p.tenant_id, evidence.value["path"])
+        return FileResponse(path, media_type="image/png", filename="bank-statement-screen.png", headers=headers)
+    if st.file is None or st.file.detected_format != "pdf":
+        raise ValidationFailed("Page images are available for PDFs; use the original export for spreadsheets")
+    import fitz
+    path = storage.resolve("statements", p.tenant_id, st.file.storage_path)
+    with fitz.open(path) as doc:
+        if doc.needs_pass:
+            raise ValidationFailed("Password-protected PDF cannot be previewed without unlocking")
+        if page > len(doc):
+            raise NotFound("Statement page not found")
+        pdf_page = doc[page - 1]
+        scale = min(1.5, 2000 / max(pdf_page.rect.width, pdf_page.rect.height, 1))
+        content = pdf_page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False).tobytes("png")
+    return Response(content=content, media_type="image/png", headers=headers)
+
+
+@router.post("/{statement_id}/confirm-extraction", summary="Confirm figures checked against the original statement")
+def confirm_extraction(statement_id: uuid.UUID, db: DB, p: Principal = require("statements:write")) -> dict:
+    db.execute(select(Statement.id).where(Statement.id == statement_id,
+        Statement.tenant_id == p.tenant_id).with_for_update())
+    st = _get(db, p.tenant_id, statement_id)
+    if st.processing_status != "needs_review" or not st.arithmetic_valid or not st.transaction_count:
+        raise ValidationFailed("Only an extracted statement with balanced arithmetic can be confirmed")
+    if st.currency != get_account(db, p.tenant_id, st.account_id).currency:
+        raise ValidationFailed("Statement currency must match the account")
+    st.processing_status = "processed_with_warnings"
+    st.warnings = [*st.warnings, {"code": "user_verified", "message": "Figures confirmed against the original by a user"}]
+    db.flush()
+    from app.balances.service import check_low_balance
+    check_low_balance(db, get_account(db, p.tenant_id, st.account_id))
+    audit(db, action="statement.extraction.confirm", tenant_id=p.tenant_id, actor_user_id=p.user_id,
+          entity_type="statement", entity_id=st.id, after={"status": st.processing_status}, ip=p.ip)
+    return S.statement(st)
 
 
 @router.post("/{statement_id}/reprocess")

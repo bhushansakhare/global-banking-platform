@@ -108,6 +108,8 @@ class NormalizedStatement:
         total = len(self.rows) + self.unparsed_rows
         if total:
             score -= Decimal("0.3") * Decimal(self.unparsed_rows) / Decimal(total)
+        if any(w.get("code") == "local_ocr" for w in self.warnings):
+            score = min(score, Decimal("0.79"))
         return max(Decimal("0"), score).quantize(Decimal("0.0001"))
 
 
