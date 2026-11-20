@@ -18,6 +18,7 @@ const MAP: Record<string, [Tone, string]> = {
   // environments / balance verification
   sandbox: ['warning', 'Sandbox'], production: ['success', 'Live'], local: ['neutral', 'Local'],
   provider_reported: ['success', 'Bank-reported'], statement_derived: ['info', 'From statement'],
+  bank_page_observed: ['success', 'Observed on bank page'],
   user_entered: ['neutral', 'User entered'], unverified: ['neutral', 'Unverified'],
   // jobs
   queued: ['neutral', 'Queued'], running: ['info', 'Running'], succeeded: ['success', 'Succeeded'],
@@ -64,4 +65,8 @@ export const JOB_LABELS: Record<string, string> = {
   open_bank_login: 'Official bank login',
   low_balance_email: 'Low-balance email',
   balance_email: 'Account balance email',
+    finzola_fetch: 'Finzola data import',
+    finzola_process: 'Finzola bank comparison',
+    finzola_test: 'Finzola destination test',
+    finzola_deliver: 'Finzola delivery',
 };

@@ -144,11 +144,11 @@ export interface Balance {
   amount: string;
   currency: string;
   as_of: string;
-  source: 'provider' | 'statement' | 'manual' | 'demo';
+  source: 'provider' | 'statement' | 'manual' | 'demo' | 'browser';
   source_ref: string | null;
   is_demo: boolean;
   captured_at: string;
-  verification_status?: 'provider_reported' | 'statement_derived' | 'user_entered' | 'demo' | 'unverified';
+  verification_status?: 'provider_reported' | 'statement_derived' | 'user_entered' | 'demo' | 'unverified' | 'bank_page_observed';
 }
 
 export interface Account {
@@ -218,6 +218,10 @@ export interface Statement {
     page_count: number | null } | null;
   institution?: string;
   bank_screenshot_available?: boolean;
+  password_required?: boolean;
+  document_access?: { password_saved: boolean; password_required: boolean; preview_ready: boolean; encrypted: boolean; page_count?: number; error?: string };
+  auto_reconcile?: boolean;
+  latest_reconciliation?: { id: string; status: string; exception_count: number; has_book_side: boolean } | null;
   parsing_jobs?: {
     id: UUID; status: string; parser_name: string | null; rows_extracted: number; rows_inserted: number;
     rows_duplicate: number; started_at: string | null; finished_at: string | null; error: string | null;

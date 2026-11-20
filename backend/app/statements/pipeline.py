@@ -87,6 +87,9 @@ def process_statement(db: Session, statement_id: uuid.UUID, *, job_id: uuid.UUID
         raise ValidationFailed("Statement not found")
     account = db.get(BankAccount, st.account_id)
     assert account is not None and st.file is not None
+    if password is None and st.file.detected_format == "pdf":
+        from app.statements.access import saved_password
+        password = saved_password(db, account, st)
     pj = StatementParsingJob(tenant_id=st.tenant_id, statement_id=st.id, automation_job_id=job_id,
                              status="running", started_at=datetime.now(UTC))
     db.add(pj)
@@ -112,6 +115,12 @@ def process_statement(db: Session, statement_id: uuid.UUID, *, job_id: uuid.UUID
                link=f"/statements/{st.id}", entity_type="statement", entity_id=st.id)
         db.flush()
         return pj
+
+    if password and st.file.detected_format == "pdf":
+        from app.statements.access import remember_password, open_pdf
+        with open_pdf(db, st, account, password=password) as doc:
+            st.file.page_count = len(doc)
+        remember_password(db, account, password, statement=st)
 
     if result.currency and result.currency != account.currency:
         result.warn("currency_mismatch", f"Statement currency {result.currency} differs from account currency "
@@ -180,6 +189,44 @@ def process_statement(db: Session, statement_id: uuid.UUID, *, job_id: uuid.UUID
                link=f"/statements/{st.id}", entity_type="statement", entity_id=st.id)
     db.flush()
     check_low_balance(db, account)
+    enqueue_reconciliation(db, st, parent_job_id=job_id)
     log.info("statement processed", extra={"ctx": {"statement": str(st.id), "status": st.processing_status,
                                                    "rows": len(result.rows), "inserted": ing.inserted}})
     return pj
+
+
+def enqueue_reconciliation(db, statement, *, parent_job_id=None, created_by=None, revision=None):
+    """Only validated, account-matching extraction can advance automatically."""
+    from app.automation import queue
+    from app.automation.handlers import settings_for
+    if (statement.processing_status not in ("processed", "processed_with_warnings")
+            or statement.arithmetic_valid is not True or not statement.transaction_count
+            or not statement.period_start or not statement.period_end or statement.duplicate_of_id):
+        return None
+    account = db.get(BankAccount, statement.account_id)
+    if statement.currency != account.currency or not settings_for(db, statement.tenant_id).auto_reconcile:
+        return None
+    from app.models.automation import AutomationJob
+    parent = db.get(AutomationJob, parent_job_id) if parent_job_id else None
+    key = f"recon:stmt:{statement.id}" + (f":{revision}" if revision else "")
+    return queue.enqueue(db, tenant_id=statement.tenant_id, job_type="reconcile_account", account_id=statement.account_id,
+        payload={"statement_id": str(statement.id)}, idempotency_key=key,
+        trigger="pipeline", parent_job_id=parent_job_id, run_id=parent.run_id if parent else None,
+        created_by=created_by or (parent.created_by if parent else None), priority=80)
+
+
+def reconcile_book_changes(db, account, dates, *, revision, user_id):
+    """New cash-book rows rerun affected validated statements without duplicating import retries."""
+    from datetime import timedelta
+    from app.reconciliation.service import tenant_rules
+    if not dates:
+        return 0
+    padding = timedelta(days=tenant_rules(db, account.tenant_id).date_tolerance_days)
+    statements = db.scalars(select(Statement).where(Statement.tenant_id == account.tenant_id,
+        Statement.account_id == account.id, Statement.deleted_at.is_(None),
+        Statement.period_start <= max(dates) + padding, Statement.period_end >= min(dates) - padding)).all()
+    queued = 0
+    for statement in statements:
+        result = enqueue_reconciliation(db, statement, created_by=user_id, revision=revision)
+        queued += int(bool(result and result[1]))
+    return queued

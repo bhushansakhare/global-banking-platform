@@ -6,6 +6,8 @@ import { Button, Card, CardHeader, DemoBadge, Field, Input, Select, StatusBadge 
 import { DataTable, Pagination } from '@/components/ui/DataTable';
 import { AutomationActions, AutomationSummary } from '@/features/accounts/AutomationControls';
 import { MonitoringControls } from '@/features/accounts/MonitoringControls';
+import { BankObservation } from '@/features/accounts/BankObservation';
+import { AutomaticBankChecks } from '@/features/accounts/AutomaticBankChecks';
 import { ConnectionSetupModal } from '@/features/accounts/ConnectionSetupModal';
 import { ConfirmDialog, Modal } from '@/components/ui/Modal';
 import { KeyValue, Notice, PageHeader } from '@/components/ui/layout';
@@ -92,12 +94,17 @@ export default function AccountDetail() {
           {can('statements:write') && <Button variant="outline" icon={<Upload className="h-4 w-4" />} onClick={() => setUpload(true)}>Upload statement (fallback)</Button>}
           {can('connections:manage') && <Button variant="outline" icon={<Settings2 className="h-4 w-4" />} onClick={() => setConnectOpen(true)}>Connection setup</Button>}
         </>} />
-      <Card className="mb-4">
+      <BankObservation accountId={a.id} />
+      <AutomaticBankChecks key={a.id} account={a} />
+      <MonitoringControls account={a} editable={can('accounts:write')} />
+      <details className="mb-4">
+        <summary className="mb-3 cursor-pointer text-sm font-medium text-muted">Advanced automation status & controls</summary>
+      <Card>
         <CardHeader title="Automation" icon={<Zap className="h-4 w-4" />}
           subtitle="Healthy is shown only after a verified synchronisation with live data." action={<AutomationActions account={a} onConnect={() => setConnectOpen(true)} size="sm" />} />
         <AutomationSummary account={a} />
       </Card>
-      <MonitoringControls account={a} editable={can('accounts:write')} />
+      </details>
       {a.is_demo && <div className="mb-5"><Notice tone="demo">This account is connected to the Demo Bank Simulator. All balances, transactions and statements are synthetic.</Notice></div>}
 
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-4">

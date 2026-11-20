@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { FileText, Upload } from 'lucide-react';
 import { useState } from 'react';
-import { useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { Badge, Button, Card, DemoBadge, Select, StatusBadge } from '@/components/ui/primitives';
 import { DataTable, Pagination, type Column } from '@/components/ui/DataTable';
 import { PageHeader } from '@/components/ui/layout';
@@ -40,7 +40,7 @@ export default function Statements() {
       <span className="font-medium text-ink truncate">{s.account_name}</span><DemoBadge show={s.is_demo} /></div>
       <div className="text-[12px] text-muted truncate">{s.file?.original_filename}</div></div> },
     { key: 'period', header: 'Period', cell: (s) => <span className="text-[13px] whitespace-nowrap">{date(s.period_start)} – {date(s.period_end)}</span> },
-    { key: 'status', header: 'Processing', mobile: 'meta', cell: (s) => <StatusBadge status={s.processing_status} /> },
+    { key: 'status', header: 'Processing', mobile: 'meta', cell: (s) => s.password_required ? <Badge tone="warning">PDF password needed</Badge> : <StatusBadge status={s.processing_status} /> },
     { key: 'fmt', header: 'Format', cell: (s) => <Badge>{s.file?.format.toUpperCase() ?? '—'}</Badge> },
     { key: 'src', header: 'Source', cell: (s) => <span className="text-[13px]">{SOURCE[s.source] ?? s.source}</span> },
     { key: 'tx', header: 'Txns', align: 'right', cell: (s) => <span className="num">{s.transaction_count ?? '—'}</span> },
@@ -53,11 +53,18 @@ export default function Statements() {
 
   return (
     <>
-      <PageHeader eyebrow="Data" title="Statements" subtitle="Downloaded and uploaded statements with extraction status. Originals are stored unchanged and content-hashed for duplicate detection."
+      <PageHeader eyebrow="Data" title="Statements" subtitle="Upload statements for an account, unlock its first protected PDF once, and let extraction and validated reconciliation continue automatically."
         actions={can('statements:write') && <>
           <Button variant="outline" loading={extract.isPending} onClick={() => extract.mutate(undefined)}>Extract pending statements</Button>
           <Button icon={<Upload className="h-4 w-4" />} onClick={() => setUpload(true)}>Upload statement</Button></>} />
       {extractionMessage && <div className="mb-4"><Notice>{extractionMessage}</Notice></div>}
+      <Card className="mb-4">
+        <div className="grid gap-4 sm:grid-cols-3 text-sm">
+          <div><p className="font-medium">1. Select the right bank account</p><p className="mt-1 text-muted">Upload one or multiple PDFs, Excel files or CSVs for that account.</p></div>
+          <div><p className="font-medium">2. Save its PDF password once</p><p className="mt-1 text-muted">Open a protected statement and use Unlock & save. Other accounts keep separate passwords.</p></div>
+          <div><p className="font-medium">3. Review results automatically</p><p className="mt-1 text-muted">Readable statements extract and verify. <Link className="link" to="/reconciliation">Reconciliation results</Link> update after validation.</p></div>
+        </div>
+      </Card>
       <Card padded={false}>
         <div className="flex flex-col sm:flex-row gap-3 p-4 border-b border-line">
           <Select aria-label="Account" value={account_id} onChange={(e) => setFilter('account_id', e.target.value)} className="sm:w-72">

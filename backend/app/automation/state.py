@@ -55,13 +55,17 @@ def views_for(db, tenant_id, accounts: list[BankAccount]) -> dict[Any, dict[str,
                         .order_by(AutomationJob.created_at.desc()).limit(50 * len(ids))):
         latest.setdefault(j.account_id, j)
     result = {a.id: compute_state(a, settings, latest.get(a.id)).as_dict() for a in accounts}
-    from app.automation.browser_jobs import saved_login_profile
+    from app.automation.browser_jobs import saved_login_profile, reviewed_statement_flow
     for account in accounts:
         if not is_manual(account) or not saved_login_profile(db, account):
             continue
         from app.core.config import get_settings
         browser_enabled = get_settings().browser_automation_enabled
         job = latest.get(account.id)
+        next_at = account.next_sync_at if account.sync_schedule else (settings.next_run_at if settings else None)
+        schedule_on = bool(account.automation_enabled and not account.automation_paused
+                           and settings and settings.master_enabled and not settings.paused
+                           and reviewed_statement_flow(db, account, saved_login_profile(db, account)))
         if not browser_enabled:
             view = AutomationView("provider_setup_required", "The local bank browser is disabled. Start the browser-enabled backend before running authentication.", None, None, "connect")
         elif job and job.status == "failed" and job.error_code in ("provider_not_configured", "browser_disabled"):
@@ -72,6 +76,10 @@ def views_for(db, tenant_id, accounts: list[BankAccount]) -> dict[Any, dict[str,
             view = AutomationView("waiting_for_user", job.error_message or "Complete verification on the bank page", None, None, "authorize")
         elif job and job.status == "failed":
             view = AutomationView("failed", job.error_message or "Bank login failed; check the connection", None, None, "resolve")
+        elif account.automation_paused:
+            view = AutomationView("paused", "Automatic bank checks are paused for this account.", None, None, None)
+        elif schedule_on:
+            view = AutomationView("scheduled", "The bank window opens at your scheduled time. Approve QR / OTP; balance, screenshot and email continue automatically.", next_at, None, None)
         else:
             view = AutomationView("ready", "Saved bank login is ready. Run now opens the visible browser; statement retrieval depends on the reviewed bank profile.", None, None, None)
         result[account.id] = view.as_dict()

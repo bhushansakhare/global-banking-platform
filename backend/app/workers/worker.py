@@ -138,7 +138,7 @@ def execute_job(job_id: uuid.UUID) -> str:
                 code, retryable = "internal_error", True
                 log.error("job crashed", extra={"ctx": {"job": str(job_id), "trace": traceback.format_exc()[-2000:]}})
             permanent = queue.fail(db, job, code=code, message=message, retryable=retryable,
-                                   base_delay=settings.retry_base_seconds)
+                                   base_delay=3 if job.job_type == "finzola_deliver" else settings.retry_base_seconds)
             if isinstance(exc, (ConsentExpired, AuthenticationRequired)):
                 _mark_connection(db, job, "consent_expired" if isinstance(exc, ConsentExpired) else "requires_auth",
                                  message)
@@ -165,6 +165,8 @@ def execute_job(job_id: uuid.UUID) -> str:
 
 
 def _mark_connection(db, job: AutomationJob, status: str, message: str, failure: bool = False) -> None:
+    if job.job_type.startswith("finzola_"):
+        return
     if not job.account_id or job.job_type != "collect_account":
         return
     acc = db.get(BankAccount, job.account_id)

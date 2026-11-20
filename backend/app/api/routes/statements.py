@@ -19,6 +19,7 @@ from app.models.transactions import Transaction
 from app.services.banking import get_account
 from app.statements import storage
 from app.statements.pipeline import process_statement, register_statement
+from app.statements.access import UnlockRequest
 
 router = APIRouter(prefix="/statements", tags=["statements"])
 
@@ -72,10 +73,10 @@ async def upload(db: DB, account_id: uuid.UUID = Form(...), file: UploadFile = F
     if process_now:
         process_statement(db, st.id)
         db.refresh(st)
-        if st.period_start and st.period_end:
-            queue.enqueue(db, tenant_id=p.tenant_id, job_type="reconcile_account", account_id=acc.id,
-                          payload={"statement_id": str(st.id)}, idempotency_key=f"recon:stmt:{st.id}",
-                          trigger="pipeline", created_by=p.user_id, priority=80)
+    else:
+        queue.enqueue(db, tenant_id=p.tenant_id, job_type="parse_statement", account_id=acc.id,
+            payload={"statement_id": str(st.id)}, idempotency_key=f"parse:{st.id}", trigger="pipeline",
+            created_by=p.user_id, max_attempts=1, priority=50)
     return {"duplicate": False, "statement": S.statement(st, acc.nickname)}
 
 
@@ -120,7 +121,71 @@ def get_statement(statement_id: uuid.UUID, db: DB, p: Principal = require("state
     from app.models.system import SystemSetting
     out["bank_screenshot_available"] = db.scalar(select(SystemSetting.id).where(
         SystemSetting.tenant_id == p.tenant_id, SystemSetting.key == f"statement_evidence:{st.id}")) is not None
+    from app.statements.access import access_status
+    from app.models.reconciliation import ReconciliationSession
+    from app.automation.handlers import settings_for
+    out["document_access"] = access_status(db, st, acc)
+    latest = db.scalar(select(ReconciliationSession).where(ReconciliationSession.tenant_id == p.tenant_id,
+        ReconciliationSession.account_id == st.account_id, ReconciliationSession.statement_id == st.id)
+        .order_by(ReconciliationSession.created_at.desc()).limit(1))
+    out["latest_reconciliation"] = None if latest is None else {
+        "id": str(latest.id), "status": latest.status, "exception_count": latest.exception_count,
+        "has_book_side": (latest.summary or {}).get("has_book_side", False)}
+    out["auto_reconcile"] = settings_for(db, p.tenant_id).auto_reconcile
     return out
+
+
+@router.post("/{statement_id}/unlock", summary="Verify and remember this account's PDF statement password")
+def unlock_statement(statement_id: uuid.UUID, body: UnlockRequest, db: DB,
+                      p: Principal = require("statements:write")) -> dict:
+    from app.statements.access import open_pdf, remember_password, password_required
+    from app.models.automation import AutomationJob
+    st = _get(db, p.tenant_id, statement_id)
+    account = get_account(db, p.tenant_id, st.account_id)
+    password = body.password.get_secret_value()
+    with open_pdf(db, st, account, password=password) as doc:
+        if not doc.needs_pass:
+            raise ValidationFailed("This PDF is not password protected")
+        st.file.page_count = len(doc)
+    remember_password(db, account, password, user_id=p.user_id)
+    remember_password(db, account, password, statement=st, user_id=p.user_id)
+    process_statement(db, st.id, password=password)
+    db.flush()
+    queued = 0
+    others = db.scalars(select(Statement).where(Statement.tenant_id == p.tenant_id,
+        Statement.account_id == account.id, Statement.id != st.id, Statement.deleted_at.is_(None),
+        Statement.processing_status.in_(("pending", "needs_review", "failed", "needs_ocr")))
+        .order_by(Statement.created_at).limit(500)).all()
+    for other in others:
+        if other.processing_status != "pending" and not password_required(other):
+            continue
+        active = db.scalar(select(AutomationJob.id).where(AutomationJob.tenant_id == p.tenant_id,
+            AutomationJob.job_type == "parse_statement", AutomationJob.payload["statement_id"].astext == str(other.id),
+            AutomationJob.status.in_(queue.ACTIVE_STATES)).limit(1))
+        if active:
+            continue
+        queue.enqueue(db, tenant_id=p.tenant_id, account_id=account.id, job_type="parse_statement",
+            payload={"statement_id": str(other.id)}, trigger="pipeline", created_by=p.user_id, max_attempts=1, priority=50)
+        queued += 1
+    audit(db, action="statement.password.save", tenant_id=p.tenant_id, actor_user_id=p.user_id,
+          entity_type="statement", entity_id=st.id, after={"account_password_saved": True, "statements_queued": queued}, ip=p.ip)
+    db.commit()  # Do not acknowledge a saved password before the transaction is durable.
+    return {"statement": S.statement(st, account.nickname), "password_saved": True, "statements_queued": queued}
+
+
+@router.get("/{statement_id}/preview", summary="Display an unlocked PDF copy; original remains encrypted")
+def preview_statement(statement_id: uuid.UUID, db: DB, p: Principal = require("statements:read")):
+    import fitz
+    from app.statements.access import open_pdf
+    st = _get(db, p.tenant_id, statement_id)
+    account = get_account(db, p.tenant_id, st.account_id)
+    with open_pdf(db, st, account) as doc:
+        content = doc.tobytes(encryption=fitz.PDF_ENCRYPT_NONE)
+    audit(db, action="statement.preview", tenant_id=p.tenant_id, actor_user_id=p.user_id,
+          entity_type="statement", entity_id=st.id, ip=p.ip)
+    return Response(content=content, media_type="application/pdf", headers={
+        "Content-Disposition": 'inline; filename="statement-preview.pdf"', "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff"})
 
 
 @router.get("/{statement_id}/transactions")
@@ -164,10 +229,8 @@ def statement_screenshot(statement_id: uuid.UUID, db: DB, p: Principal = require
     if st.file is None or st.file.detected_format != "pdf":
         raise ValidationFailed("Page images are available for PDFs; use the original export for spreadsheets")
     import fitz
-    path = storage.resolve("statements", p.tenant_id, st.file.storage_path)
-    with fitz.open(path) as doc:
-        if doc.needs_pass:
-            raise ValidationFailed("Password-protected PDF cannot be previewed without unlocking")
+    from app.statements.access import open_pdf
+    with open_pdf(db, st, get_account(db, p.tenant_id, st.account_id)) as doc:
         if page > len(doc):
             raise NotFound("Statement page not found")
         pdf_page = doc[page - 1]
@@ -190,6 +253,8 @@ def confirm_extraction(statement_id: uuid.UUID, db: DB, p: Principal = require("
     db.flush()
     from app.balances.service import check_low_balance
     check_low_balance(db, get_account(db, p.tenant_id, st.account_id))
+    from app.statements.pipeline import enqueue_reconciliation
+    enqueue_reconciliation(db, st, created_by=p.user_id)
     audit(db, action="statement.extraction.confirm", tenant_id=p.tenant_id, actor_user_id=p.user_id,
           entity_type="statement", entity_id=st.id, after={"status": st.processing_status}, ip=p.ip)
     return S.statement(st)

@@ -18,6 +18,8 @@ export interface BrowserProfile {
 export interface BrowserStatus {
   enabled: boolean; profile_key: string | null; has_customer_id: boolean; has_password?: boolean; profiles: BrowserProfile[];
   browser_mode?: 'headed'; verification_wait_seconds?: number;
+  preferred_login_method?: 'password' | 'qr';
+  observation_supported?: boolean;
   job: { id: string; status: string; message: string | null; error: string | null; result: Record<string, unknown>;
     error_code?: string | null; requires_user_action?: string | null } | null;
 }
@@ -151,7 +153,7 @@ export const transactionsApi = {
     const f = new FormData();
     f.append('account_id', accountId);
     f.append('file', file);
-    return request<{ created: number; skipped_duplicates: number }>('/book-entries/import', { method: 'POST', form: f });
+    return request<{ created: number; skipped_duplicates: number; reconciliations_queued?: number }>('/book-entries/import', { method: 'POST', form: f });
   },
   createBookEntry: (b: { account_id: string; entry_date: string; description: string; amount: string; reference?: string }) =>
     request<BookEntry>('/book-entries', { method: 'POST', body: b }),

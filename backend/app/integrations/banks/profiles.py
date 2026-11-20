@@ -128,6 +128,7 @@ HDFC = BrowserProfile(
     key="hdfc_bank", name="HDFC Bank", country="IN", aliases=["hdfc", "hdfc bank ltd", "hdfc bank limited"],
     currencies=["INR"], website="https://www.hdfc.bank.in/",
     login_url="https://now.hdfc.bank.in/retail-app/", domains=["www.hdfc.bank.in", "now.hdfc.bank.in"],
+    resource_domains=["mbrww.hdfcbank.com", "nextgenhtml.hdfcbank.com", "api-now.hdfc.bank.in"],
     official_reference="https://www.hdfc.bank.in/online-services",
     login_fields_reviewed=True, customer_id_selector="#username", password_selector="#password", submit_selector="#kc-login",
     credential_storage_notice="HDFC's published IPIN terms instruct customers not to record the IPIN electronically. "

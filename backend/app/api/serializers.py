@@ -73,6 +73,7 @@ def balance(b: AccountBalance) -> dict[str, Any]:
 
 
 def statement(s: Statement, account_name: str | None = None) -> dict[str, Any]:
+    from app.statements.access import password_required
     return {"id": str(s.id), "account_id": str(s.account_id), "account_name": account_name, "source": s.source,
             "period_start": s.period_start, "period_end": s.period_end, "opening_balance": money(s.opening_balance),
             "closing_balance": money(s.closing_balance), "total_credits": money(s.total_credits),
@@ -80,7 +81,8 @@ def statement(s: Statement, account_name: str | None = None) -> dict[str, Any]:
             "download_status": s.download_status, "processing_status": s.processing_status,
             "arithmetic_valid": s.arithmetic_valid, "arithmetic_difference": money(s.arithmetic_difference),
             "parser_name": s.parser_name, "parse_confidence": str(s.parse_confidence) if s.parse_confidence else None,
-            "warnings": s.warnings, "duplicate_of_id": str(s.duplicate_of_id) if s.duplicate_of_id else None,
+            "warnings": s.warnings, "password_required": password_required(s),
+            "duplicate_of_id": str(s.duplicate_of_id) if s.duplicate_of_id else None,
             "downloaded_at": s.downloaded_at, "created_at": s.created_at, "is_demo": s.is_demo,
             "file": {"original_filename": s.file.original_filename, "format": s.file.detected_format,
                      "size_bytes": s.file.size_bytes, "sha256": s.file.sha256, "scanned": s.file.is_scanned_pdf,

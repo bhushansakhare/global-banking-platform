@@ -37,7 +37,7 @@ def overview(db: DB, p: Principal = require("automation:read")) -> dict:
                                                 BankAccount.deleted_at.is_(None)).order_by(BankAccount.nickname)).all()
     latest: dict[uuid.UUID, AutomationJob] = {}
     for j in db.scalars(select(AutomationJob).where(AutomationJob.tenant_id == p.tenant_id,
-                                                    AutomationJob.job_type == "collect_account",
+                                                    AutomationJob.job_type.in_(("collect_account", "open_bank_login")),
                                                     AutomationJob.created_at >= datetime.now(UTC) - timedelta(days=7))
                         .order_by(AutomationJob.created_at.desc())):
         latest.setdefault(j.account_id, j)

@@ -20,6 +20,7 @@ export const NAV = [
   { to: '/transactions', label: 'Transactions', icon: ArrowLeftRight, perm: 'transactions:read' },
   { to: '/balances', label: 'Balances', icon: Building2, perm: 'accounts:read' },
   { to: '/reconciliation', label: 'Reconciliation', icon: GitCompareArrows, perm: 'reconciliation:read' },
+  { to: '/integrations/finzola', label: 'Finzola', icon: ArrowLeftRight, perm: 'settings:read' },
   { to: '/analytics', label: 'Analytics', icon: LineChart, perm: 'dashboard:read' },
   { to: '/reports', label: 'Reports', icon: FileSpreadsheet, perm: 'reports:read' },
   { to: '/notifications', label: 'Notifications', icon: Bell, perm: 'notifications:read' },

@@ -108,7 +108,7 @@ export default function Automation() {
   return (
     <>
       <PageHeader eyebrow="Automation" title="Automation Center"
-        subtitle="Switch automation on once and the engine collects, extracts, reconciles and reports every day. One bank failing never stops the others."
+        subtitle="Set a schedule once. Bank checks and email reports run automatically; approve bank QR / OTP whenever requested. Keep this computer and the software running."
         actions={manage && <>
           <Button variant="outline" icon={<RotateCcw className="h-4 w-4" />} loading={retryAll.isPending} onClick={() => retryAll.mutate(undefined)}>Retry failed</Button>
           <Button icon={<Play className="h-4 w-4" />} loading={runNow.isPending} onClick={() => runNow.mutate(undefined)}>Run now</Button>

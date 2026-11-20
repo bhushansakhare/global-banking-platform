@@ -19,7 +19,7 @@ export function BrowserBankConnection({ account }: { account: Account }) {
   const [editing, setEditing] = useState(false);
   const [config, setConfig] = useState('');
   const [configError, setConfigError] = useState<string | null>(null);
-  const invalidations = [['bank-browser', account.id], ['account', account.id], ['accounts'], ['automation']];
+  const invalidations = [['bank-browser', account.id], ['monitoring', account.id], ['account', account.id], ['accounts'], ['automation']];
   const start = useAction((loginOnly: boolean) => browserBankingApi.start(account.id, {
     profile_key: selected || q.data?.profile_key || '', customer_id: customer || undefined,
     login_only: loginOnly, date_from: from || undefined, date_to: to || undefined,
@@ -33,7 +33,8 @@ export function BrowserBankConnection({ account }: { account: Account }) {
   });
   const authenticate = useAction(() => browserBankingApi.start(account.id, {
     profile_key: selected || q.data?.profile_key || '', login_only: !profile?.capabilities.automatic_statement_retrieval,
-    authenticate: true, date_from: from || undefined, date_to: to || undefined,
+    authenticate: q.data?.preferred_login_method !== 'qr', qr_login: q.data?.preferred_login_method === 'qr',
+    date_from: from || undefined, date_to: to || undefined,
   }), { invalidate: invalidations, success: 'Authentication queued — finish any bank verification in the visible browser' });
   const qrLogin = useAction(() => browserBankingApi.start(account.id, {
     profile_key: selected || q.data?.profile_key || '', login_only: !profile?.capabilities.automatic_statement_retrieval,
@@ -68,7 +69,7 @@ export function BrowserBankConnection({ account }: { account: Account }) {
       <div className="rounded-lg bg-surface-2 p-3 space-y-2">
         <Button variant="outline" disabled={!canConnect || !q.data?.enabled || !!busy} loading={qrLogin.isPending}
           onClick={() => qrLogin.mutate(undefined)}>QR / bank app login</Button>
-        <p className="text-sm text-muted">If your bank offers QR login, choose its QR option in the visible bank window, then scan and approve with its official banking app. Saved ID/password are not submitted in this mode. After approval, a supported statement workflow continues automatically.</p>
+        <p className="text-sm text-muted">For HDFC, the software selects “Click here to Scan QR Code” automatically when that option is available. Scan and approve with the official bank app. If the bank changes its page, choose QR login there manually. Saved ID/password are not submitted. After approval, a supported statement workflow continues automatically.</p>
         {profile.key === 'hdfc_bank' && <a className="link text-sm" href="https://www.hdfc.bank.in/resources/way-to-bank/online-banking/net-banking/two-step-verification" target="_blank" rel="noopener noreferrer">HDFC QR login instructions</a>}
       </div>
       <Field label="Customer ID / User ID" htmlFor="browser-customer"
@@ -88,7 +89,8 @@ export function BrowserBankConnection({ account }: { account: Account }) {
         <div className="flex flex-wrap gap-2">
           <Button variant="outline" disabled={!canConnect || !!busy || !customer.trim()} loading={saveLogin.isPending}
             onClick={() => saveLogin.mutate(undefined)}>Save bank login</Button>
-          <Button disabled={!canConnect || !q.data?.enabled || !!busy || !q.data?.has_password || profile.key !== q.data.profile_key || !!customer || !!password}
+          <Button disabled={!canConnect || !q.data?.enabled || !!busy || (q.data?.preferred_login_method !== 'qr' &&
+            (!q.data?.has_password || profile.key !== q.data.profile_key || !!customer || !!password))}
             loading={authenticate.isPending} onClick={() => authenticate.mutate(undefined)}>Authenticate</Button>
           {q.data?.has_password && profile.key === q.data.profile_key && <Button variant="ghost" disabled={!canConnect || !!busy}
             loading={forgetLogin.isPending} onClick={() => forgetLogin.mutate(undefined)}>Forget saved login</Button>}
@@ -99,15 +101,16 @@ export function BrowserBankConnection({ account }: { account: Account }) {
         <Field label="Statement from" htmlFor="browser-from"><Input id="browser-from" type="date" value={from} onChange={(e) => setFrom(e.target.value)} /></Field>
         <Field label="Statement to" htmlFor="browser-to"><Input id="browser-to" type="date" value={to} onChange={(e) => setTo(e.target.value)} /></Field>
       </div>
-      {!profile.capabilities.automatic_statement_retrieval && <Notice tone="warning" title="Statement automation requires profile review">
+      {q.data?.observation_supported && <Notice>After login, the software opens the statement screen, checks this account's balance, saves its screenshot and compares your balance target.</Notice>}
+      {!profile.capabilities.automatic_statement_retrieval && !q.data?.observation_supported && <Notice tone="warning" title="Statement automation requires profile review">
         {profile.limitations.join(' ') || 'Bank permission and statement navigation have not been verified.'}
         {' '}Opening login does not mark this account connected or synced.
       </Notice>}
       {!q.data?.enabled && <Notice tone="warning">Local bank browser is disabled. Enable BROWSER_AUTOMATION_ENABLED on this Windows desktop and restart the backend.</Notice>}
       <div className="flex flex-wrap gap-2">
         <Button disabled={!canConnect || !q.data?.enabled || !!busy} loading={start.isPending} onClick={() => start.mutate(true)}>Open bank login</Button>
-        <Button disabled={!canConnect || !q.data?.enabled || !!busy || !profile.capabilities.automatic_statement_retrieval}
-          loading={start.isPending} onClick={() => start.mutate(false)}>Connect and retrieve statements</Button>
+        {!q.data?.observation_supported && <Button disabled={!canConnect || !q.data?.enabled || !!busy || !profile.capabilities.automatic_statement_retrieval}
+          loading={start.isPending} onClick={() => start.mutate(false)}>Connect and retrieve statements</Button>}
         {canCancel && busy && q.data?.job && <Button variant="outline" onClick={() => cancel.mutate(q.data!.job!.id)}>Close bank session</Button>}
       </div>
       {start.error && <Notice tone="danger">{errorText(start.error)}</Notice>}
@@ -119,7 +122,9 @@ export function BrowserBankConnection({ account }: { account: Account }) {
         Automatic retries are paused. Use Open bank login for a fresh session and complete login manually.
         If normal bank login also fails, contact the bank. If it succeeds, this bank's automated flow needs review.
       </Notice>}
-      {q.data.job.result?.data_retrieved === true && <p>Statements retrieved. Processing jobs update transactions and statement balances.</p>}
+      {q.data.job.result?.data_retrieved === true && (q.data.job.result.source === 'bank_page_observed'
+        ? <p>Bank balance checked and screenshot saved. The observed balance is compared with your account target.</p>
+        : <p>Statements retrieved. Processing jobs update transactions and statement balances.</p>)}
     </div>}
     {canConfigure && <details onToggle={(e) => setEditing(e.currentTarget.open)} open={editing}>
       <summary className="cursor-pointer text-sm text-muted">Configure another bank profile</summary>

@@ -6,8 +6,10 @@ from app.models.reconciliation import ReconciliationException, ReconciliationMat
 from app.models.statements import Statement, StatementFile, StatementParsingJob
 from app.models.system import AuditLog, Notification, NotificationPreference, Report, SystemSetting
 from app.models.transactions import BookEntry, Transaction, TransactionCategory
+from app.models.finzola import FinzolaRecord, FinzolaMapping, FinzolaItem, FinzolaDestination, FinzolaDelivery
 
 __all__ = [
+    "FinzolaRecord", "FinzolaMapping", "FinzolaItem", "FinzolaDestination", "FinzolaDelivery",
     "AccountBalance", "AccountConsent", "AuditLog", "AutomationJob", "AutomationJobLog", "AutomationSettings",
     "BankAccount", "BankConnection", "BankProvider", "BookEntry", "Country", "ExchangeRate", "Institution",
     "Notification", "NotificationPreference", "Organization", "Permission", "ReconciliationException",

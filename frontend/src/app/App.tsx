@@ -26,6 +26,7 @@ const Reports = lazy(() => import('@/pages/Reports'));
 const Notifications = lazy(() => import('@/pages/Notifications'));
 const AuditLogs = lazy(() => import('@/pages/AuditLogs'));
 const SettingsPage = lazy(() => import('@/pages/Settings'));
+const Finzola = lazy(() => import('@/pages/Finzola'));
 const NotFound = lazy(() => import('@/pages/NotFound'));
 
 export const queryClient = new QueryClient({
@@ -93,6 +94,7 @@ function Routed() {
           <Route path="balances" element={<Balances />} />
           <Route path="reconciliation" element={<Reconciliation />} />
           <Route path="reconciliation/:id" element={<ReconciliationDetail />} />
+          <Route path="integrations/finzola" element={<Finzola />} />
           <Route path="analytics" element={<Analytics />} />
           <Route path="reports" element={<Reports />} />
           <Route path="notifications" element={<Notifications />} />

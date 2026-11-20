@@ -41,14 +41,30 @@ class BankAuthorizationDenied(UserActionRequired):
                          "Automatic login retries are paused.", action="bank_access_denied")
 
 
+class BankSessionEnded(UserActionRequired):
+    code = "bank_session_ended"
+
+    def __init__(self):
+        super().__init__("The bank ended this session and opened its logout page. "
+                         "No statement retrieval was verified; automatic login retries are paused.", action="bank_session_ended")
+
+
+class BankObservationCaptured(Exception):
+    """The matched account balance/screen check completed without a file download."""
+
+
 def check_bank_access(page, access_state: dict) -> None:
     """A denial is not authentication-in-progress and must not trigger repeated login attempts."""
     status = access_state.get("status")
     # An authentication rejection may be returned in a successful HTTP 200 callback page.
     # Never log the URL, auth parameters or the bank's free-form error_description.
     location = page.url if isinstance(page.url, str) else ""
+    if urlsplit(location).path.rstrip("/") == "/retail-app/logoutuser":
+        raise BankSessionEnded()
     query = parse_qs(urlsplit(location).query)
     errors = {value.casefold() for key in ("error", "error_description") for value in query.get(key, [])}
+    if access_state.get("auth_error"):
+        errors.add(access_state["auth_error"])
     if errors & {"access_denied", "authorization_denied", "consent_denied"}:
         raise BankAuthorizationDenied()
     if errors & {"login_required", "interaction_required", "session_expired", "invalid_state", "invalid_grant"}:
@@ -145,6 +161,47 @@ def guard_request(route, profile: BrowserProfile, blocked: list[bool], access_st
                 response.dispose()
 
 
+AUTH_CALLBACK_ERRORS = {"access_denied", "authorization_denied", "consent_denied", "login_required",
+                        "interaction_required", "session_expired", "invalid_state", "invalid_grant"}
+
+
+def remember_auth_error(location: str, access_state: dict) -> None:
+    """Remember only a known error code; never retain the callback URL or its tokens."""
+    if not isinstance(location, str):
+        return
+    parsed = urlsplit(location)
+    stage = ("login" if parsed.path.startswith("/auth/") else "callback" if parsed.path.endswith("/select-context")
+             else "retail" if parsed.path.startswith("/retail-app") else "other")
+    stages = access_state.setdefault("navigation_stages", [])
+    if not stages or stages[-1] != stage:
+        stages.append(stage)
+        del stages[:-12]
+    query = parse_qs(parsed.query)
+    for key in ("error", "error_description"):
+        for value in query.get(key, []):
+            code = value.casefold()
+            if code in AUTH_CALLBACK_ERRORS:
+                access_state.setdefault("auth_error", code)
+                return
+
+
+def route_bank_websocket(ws, profile: BrowserProfile, access_state: dict | None = None) -> None:
+    """Permit secure official-bank live approval channels without inspecting messages."""
+    try:
+        if not ws.url.startswith("wss://"):
+            raise ValueError("Secure bank connection required")
+        validate_url("https://" + ws.url[6:], [*profile.domains, *profile.resource_domains], resolve=True)
+        ws.connect_to_server()
+        if access_state is not None:
+            access_state["secure_channels_opened"] = min(99, access_state.get("secure_channels_opened", 0) + 1)
+    except Exception:
+        if access_state is not None:
+            access_state["secure_channels_blocked"] = min(99, access_state.get("secure_channels_blocked", 0) + 1)
+        # Neither the URL (which can carry auth tokens) nor messages are logged.
+        with suppress(Exception):
+            ws.close()
+
+
 def install_native_domain_guard(context, page, profile: BrowserProfile, blocked: list[bool], access_state: dict):
     """Let Chromium send native browser requests; validate each request including redirect hops.
 
@@ -163,16 +220,37 @@ def install_native_domain_guard(context, page, profile: BrowserProfile, blocked:
         except Exception:
             if document:
                 blocked[0] = True
+            else:
+                # Host/type only: never retain URL queries, request bodies or credentials.
+                host = urlsplit(event["request"]["url"]).hostname
+                hosts = access_state.setdefault("blocked_resource_hosts", [])
+                if host and host not in hosts and len(hosts) < 12:
+                    hosts.append(host)
             with suppress(Exception):
                 session.send("Fetch.failRequest", {"requestId": request_id, "errorReason": "BlockedByClient"})
 
     def response_received(response):
-        if response.request.is_navigation_request() and response.status in (403, 429):
-            access_state["status"] = response.status
+        if (response.status >= 400 and response.request.resource_type in ("xhr", "fetch")
+                and isinstance(response.url, str)):
+            failure = {"host": urlsplit(response.url).hostname, "status": response.status}
+            failures = access_state.setdefault("failed_resource_responses", [])
+            if failure not in failures and len(failures) < 12:
+                failures.append(failure)
+        if isinstance(response.url, str) and urlsplit(response.url).path.endswith("/protocol/openid-connect/token"):
+            access_state["auth_exchange_status"] = response.status
+        if response.request.is_navigation_request():
+            remember_auth_error(response.url, access_state)
+            if response.status in (403, 429):
+                access_state["status"] = response.status
+
+    def navigated(frame):
+        if frame == page.main_frame:
+            remember_auth_error(frame.url, access_state)
 
     session.on("Fetch.requestPaused", paused)
     session.send("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]})
     page.on("response", response_received)
+    page.on("framenavigated", navigated)
     return session
 
 
@@ -217,6 +295,31 @@ def submit_saved_login(page, profile: BrowserProfile, customer_id: str, password
     read_only_click(submit, profile.submit_selector)
 
 
+def open_bank_qr_login(page, profile: BrowserProfile) -> bool:
+    """Select HDFC's named login option once; never inspect, copy or regenerate its QR."""
+    if profile.key != "hdfc_bank":
+        return False
+    from playwright.sync_api import Error, TimeoutError
+    label = re.compile(r"^\s*(?:Click here to Scan QR Code(?:[.!][\s\S]*)?|Login via QR Code)\s*$", re.I)
+    card = page.get_by_role("button", name=re.compile(r"^\s*Login without Password\b", re.I)).and_(page.locator(":visible"))
+    hint = page.get_by_text(label).and_(page.locator(":visible"))
+    # The live bank exposes a clickable role=button card. Its QR hint can be a
+    # separate noninteractive element, so prefer the actual card over its text.
+    for target, timeout in ((card, 15000), (hint, 3000)):
+        try:
+            target.wait_for(state="visible", timeout=timeout)
+            if target.count() != 1:
+                return False
+            validate_url(page.url, profile.domains, resolve=True)
+            read_only_click(target, "HDFC login QR option")
+            return True
+        except TimeoutError:
+            continue
+        except (Error, ValueError, OSError):
+            return False
+    return False
+
+
 def authenticated(page, profile: BrowserProfile) -> bool:
     return bool(urlsplit(page.url).path == profile.authenticated_path
                 and visible(page, profile.authenticated_selector))
@@ -235,7 +338,7 @@ def navigation_review(page, masked_number: str) -> dict:
     safe = []
     for item in controls:
         label = re.sub(r"\d{5,}", "[masked]", item["label"])
-        if not re.search(r"\b(account|statement|download|export|pdf|csv|excel|history|date|view|search|logout|savings|banking)\b", label, re.I) \
+        if not re.search(r"\b(account|statement|download|export|pdf|csv|excel|history|date|view|search|logout|savings|banking|qr|scan|kavach)\b", label, re.I) \
                 and item["tag"] != "input":
             continue
         selector = None
@@ -250,7 +353,7 @@ def navigation_review(page, masked_number: str) -> dict:
         suffix.length === 4 && n.innerText.includes(suffix)).slice(0, 8).map(n => ({id:n.id || '', tag:n.tagName.toLowerCase()}))""", suffix)
     account_selectors = [f"#{x['id']}" for x in candidates if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,60}", x["id"])
                          and not re.search(r"\d{5,}", x["id"])]
-    return {"path": re.sub(r"\d{5,}", "[masked]", urlsplit(page.url).path), "controls": safe,
+    return {"path": re.sub(r"\d{5,}", "[masked]", urlsplit(page.url).path.split(";")[0]), "controls": safe,
             "account_selector_candidates": account_selectors, "verified": False}
 
 
@@ -266,12 +369,27 @@ def confirm_account(page, profile: BrowserProfile, masked_number: str) -> None:
             raise ProfileReviewRequired("The bank page account does not match this linked account")
 
 
+def session_review(page, masked_number, access_state, qr_option_selected):
+    evidence = navigation_review(page, masked_number)
+    evidence.update(qr_option_selected=qr_option_selected,
+        navigation_stages=list(access_state.get("navigation_stages", [])),
+        secure_channels_opened=access_state.get("secure_channels_opened", 0),
+        secure_channels_blocked=access_state.get("secure_channels_blocked", 0),
+        blocked_resource_hosts=list(access_state.get("blocked_resource_hosts", [])),
+        auth_exchange_status=access_state.get("auth_exchange_status"),
+        failed_resource_responses=list(access_state.get("failed_resource_responses", [])))
+    return evidence
+
+
 def retrieve(profile: BrowserProfile, *, customer_id: str, masked_number: str,
              date_from: date, date_to: date, progress, login_only: bool = False, password: str = "",
-    on_review=None, verification_wait_seconds: int | None = None, on_statement_screenshot=None) -> list[tuple[str, bytes]]:
+    on_review=None, verification_wait_seconds: int | None = None, on_statement_screenshot=None,
+    qr_login: bool = False, session_control=None) -> list[tuple[str, bytes]]:
     settings = get_settings()
     if not settings.browser_automation_enabled:
         raise ConfigurationMissing("Set BROWSER_AUTOMATION_ENABLED=true on the local Windows desktop")
+    if qr_login and (customer_id or password):
+        raise ConfigurationMissing("QR login must not submit a Customer ID or password")
     if not login_only and not profile.retrieval_supported:
         raise ConfigurationMissing("Statement retrieval requires a reviewed, permitted bank profile")
     try:
@@ -281,6 +399,7 @@ def retrieve(profile: BrowserProfile, *, customer_id: str, masked_number: str,
     from playwright.sync_api import Error, sync_playwright
 
     files: list[tuple[str, bytes]] = []
+    qr_option_opened = False
     blocked = [False]
     access_state: dict = {}
     try:
@@ -290,7 +409,7 @@ def retrieve(profile: BrowserProfile, *, customer_id: str, masked_number: str,
             try:
                 context = browser.new_context(accept_downloads=True, ignore_https_errors=False,
                                               service_workers="block")
-                context.route_web_socket("**/*", lambda ws: ws.close())
+                context.route_web_socket("**/*", lambda ws: route_bank_websocket(ws, profile, access_state))
                 # Keep authentication in a single visible page; no uncontrolled popup sessions.
                 page = context.new_page()
                 install_native_domain_guard(context, page, profile, blocked, access_state)
@@ -301,7 +420,11 @@ def retrieve(profile: BrowserProfile, *, customer_id: str, masked_number: str,
                 check_bank_access(page, access_state)
                 # A reviewed Customer ID field is independent of unverified statement retrieval.
                 # A password-bearing login form remains under the customer's direct control.
-                if password:
+                if qr_login:
+                    qr_option_opened = open_bank_qr_login(page, profile)
+                    progress(15, "Bank QR login selected; scan and approve with the official bank app" if qr_option_opened else
+                             "Choose QR login on the bank page, then scan and approve with the official bank app")
+                elif password:
                     submit_saved_login(page, profile, customer_id, password)
                     progress(15, "Bank login submitted; complete OTP, CAPTCHA or app approval on the bank page")
                 else:
@@ -311,6 +434,7 @@ def retrieve(profile: BrowserProfile, *, customer_id: str, masked_number: str,
                     raise ConfigurationMissing("Bank verification wait must be between 60 and 720 seconds")
                 deadline = time.monotonic() + wait_seconds
                 last_review_time, previous_review = 0.0, None
+                login_confirmed = False
                 while time.monotonic() < deadline:
                     if blocked[0]:
                         raise ProfileReviewRequired("Bank navigation reached an unreviewed domain")
@@ -318,29 +442,58 @@ def retrieve(profile: BrowserProfile, *, customer_id: str, masked_number: str,
                         if login_only:
                             return []
                         raise UserActionRequired("Bank browser closed before retrieval completed", action="reauth")
-                    check_bank_access(page, access_state)
+                    try:
+                        check_bank_access(page, access_state)
+                    except UserActionRequired:
+                        if on_review:
+                            with suppress(Error):
+                                on_review(session_review(page, masked_number, access_state, qr_option_opened))
+                        raise
                     if visible(page, profile.failed_selector):
                         raise UserActionRequired("Bank login failed. Verify directly on the official page.", action="reauth")
                     if visible(page, profile.expired_selector):
                         raise UserActionRequired("Bank session expired; authenticate again", action="reauth")
+                    path = urlsplit(page.url).path.split(";")[0]
+                    if (login_only and profile.key == "hdfc_bank" and
+                        (path == "/retail-app/dashboard" or path.startswith("/retail-app/my-accounts/")) and
+                        page.get_by_role("button", name="Logout", exact=True).count() == 1):
+                        if not login_confirmed:
+                            login_confirmed = True
+                            deadline = time.monotonic() + 600
+                            progress(30, "Bank login confirmed; preparing statement capture")
+                        if session_control:
+                            statement_button = page.get_by_role("button", name="Get Statement for Savings Accounts", exact=True)
+                            if path == "/retail-app/dashboard" and statement_button.count() == 1:
+                                read_only_click(statement_button, "Get Statement for Savings Accounts")
+                            if path.startswith("/retail-app/my-accounts/"):
+                                try:
+                                    captured = session_control(page)
+                                except BankObservationCaptured:
+                                    return []
+                                if captured:
+                                    files.extend(captured)
+                                    break
                     if not login_only and authenticated(page, profile):
                         break
                     if login_only and on_review and time.monotonic() - last_review_time >= 5:
                         last_review_time = time.monotonic()
                         try:
-                            evidence = navigation_review(page, masked_number)
+                            evidence = (session_review(page, masked_number, access_state, qr_option_opened) if qr_login
+                                        else navigation_review(page, masked_number))
+                            evidence["authentication_confirmed"] = login_confirmed
                             if evidence != previous_review:
                                 on_review(evidence)
                                 previous_review = evidence
                         except Error:
                             pass  # the customer may be navigating between bank pages
                     remaining = max(0, int(deadline - time.monotonic()))
-                    progress(15, f"Waiting for authentication on the official bank page ({remaining}s remaining)")
+                    progress(30 if login_confirmed else 15,
+                             f"{'Bank login confirmed; statement capture' if login_confirmed else 'Waiting for authentication on the official bank page'} ({remaining}s remaining)")
                     page.wait_for_timeout(1000)
                 else:
                     raise UserActionRequired("Bank login timed out; open the bank browser again", action="reauth")
                 if login_only:
-                    return []
+                    return files
                 progress(40, "Authentication confirmed; checking linked account")
                 confirm_account(page, profile, masked_number)
                 for step in profile.steps:

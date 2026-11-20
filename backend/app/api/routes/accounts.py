@@ -30,19 +30,107 @@ from app.services import connections as conn_svc
 router = APIRouter(tags=["accounts"])
 
 from app.services.monitoring import MonitoringSettings, MonitoringUpdate  # noqa: E402
+from app.services.account_mail import MailUpdate  # noqa: E402
+
+
+@router.get("/accounts/{account_id}/statement-password")
+def statement_password_status(account_id: uuid.UUID, db: DB, p: Principal = require("statements:read")) -> dict:
+    from app.models.system import SystemSetting
+    from app.statements.access import key_for
+    account = banking.get_account(db, p.tenant_id, account_id)
+    saved = db.scalar(select(SystemSetting.id).where(SystemSetting.tenant_id == p.tenant_id,
+        SystemSetting.key == key_for(account))) is not None
+    return {"password_saved": saved}
+
+
+@router.delete("/accounts/{account_id}/statement-password", status_code=204)
+def forget_statement_password(account_id: uuid.UUID, db: DB, p: Principal = require("statements:write")):
+    from sqlalchemy import delete, or_
+    from app.models.system import SystemSetting
+    from app.statements.access import key_for
+    account = banking.get_account(db, p.tenant_id, account_id)
+    key = key_for(account)
+    db.execute(delete(SystemSetting).where(SystemSetting.tenant_id == p.tenant_id,
+        or_(SystemSetting.key == key, SystemSetting.key.startswith(key + ":"))))
+    audit(db, action="account.statement_password.forget", tenant_id=p.tenant_id, actor_user_id=p.user_id,
+          entity_type="bank_account", entity_id=account.id, ip=p.ip)
+
+
+@router.get("/accounts/{account_id}/mail-settings")
+def get_mail_settings(account_id: uuid.UUID, db: DB, p: Principal = require("accounts:write")) -> dict:
+    from app.services.account_mail import public_settings
+    account = banking.get_account(db, p.tenant_id, account_id)
+    return public_settings(db, account)
+
+
+@router.put("/accounts/{account_id}/mail-settings")
+def update_mail_settings(account_id: uuid.UUID, body: MailUpdate, db: DB,
+                         p: Principal = require("accounts:write")) -> dict:
+    from app.services.account_mail import public_settings, save_mail
+    account = banking.get_account(db, p.tenant_id, account_id)
+    save_mail(db, account, body, p.user_id)
+    audit(db, action="account.mail_settings.update", tenant_id=p.tenant_id, actor_user_id=p.user_id,
+          entity_type="bank_account", entity_id=account.id, after={"configured": True}, ip=p.ip)
+    return public_settings(db, account)
+
+
+@router.get("/accounts/{account_id}/bank-observation")
+def bank_observation(account_id: uuid.UUID, db: DB, p: Principal = require("accounts:read")) -> dict:
+    from decimal import Decimal
+    from app.models.system import SystemSetting
+    account = banking.get_account(db, p.tenant_id, account_id)
+    row = db.scalar(select(SystemSetting).where(SystemSetting.tenant_id == p.tenant_id,
+        SystemSetting.key == f"bank_observation:{account.id}"))
+    if row is None:
+        return {"available": False, "screenshot_available": False, "target": S.money(account.low_balance_threshold)}
+    value = row.value
+    below = Decimal(value["amount"]) < account.low_balance_threshold if account.low_balance_threshold is not None else None
+    return {"available": True, "amount": value["amount"], "currency": value["currency"],
+        "balance_type": value["balance_type"], "captured_at": value["captured_at"], "source": value["source"],
+        "screenshot_available": value.get("screenshot_available", False),
+        "target": S.money(account.low_balance_threshold), "below_target": below}
+
+
+@router.get("/accounts/{account_id}/bank-observation/screenshot")
+def bank_observation_screenshot(account_id: uuid.UUID, db: DB, p: Principal = require("statements:read")):
+    from fastapi.responses import FileResponse
+    from app.models.system import SystemSetting
+    from app.statements.storage import resolve, sha256_bytes
+    from app.core.errors import NotFound
+    account = banking.get_account(db, p.tenant_id, account_id)
+    row = db.scalar(select(SystemSetting).where(SystemSetting.tenant_id == p.tenant_id,
+        SystemSetting.key == f"bank_observation:{account.id}"))
+    if row is None or not row.value.get("image_path"):
+        raise NotFound("No bank screenshot saved for this account")
+    path = resolve("bank_evidence", p.tenant_id, row.value["image_path"])
+    if sha256_bytes(path.read_bytes()) != row.value.get("image_sha256"):
+        raise ValidationFailed("Bank screenshot integrity check failed")
+    return FileResponse(path, media_type="image/png", filename="bank-statement-screen.png",
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
 
 @router.get("/accounts/{account_id}/monitoring")
 def get_monitoring(account_id: uuid.UUID, db: DB, p: Principal = require("accounts:read")) -> dict:
-    from app.services.monitoring import settings_for, mail_ready
+    from app.services.monitoring import settings_for
+    from app.services.account_mail import ready
     account = banking.get_account(db, p.tenant_id, account_id)
-    return {**settings_for(db, account).model_dump(), "email_configured": mail_ready()}
+    latest_mail = db.scalar(select(AutomationJob).where(AutomationJob.tenant_id == p.tenant_id,
+        AutomationJob.account_id == account.id, AutomationJob.job_type.in_(("balance_email", "low_balance_email")))
+        .order_by(AutomationJob.created_at.desc()).limit(1))
+    delivery = None if latest_mail is None else {
+        "status": latest_mail.status, "sent": bool((latest_mail.result or {}).get("email_sent")),
+        "skipped": (latest_mail.result or {}).get("skipped"),
+        "finished_at": latest_mail.finished_at, "error": latest_mail.error_message,
+    }
+    return {**settings_for(db, account).model_dump(), "email_configured": ready(db, account),
+            "latest_email": delivery}
 
 
 @router.put("/accounts/{account_id}/monitoring")
 def update_monitoring(account_id: uuid.UUID, body: MonitoringUpdate, db: DB,
                       p: Principal = require("accounts:write")) -> dict:
-    from app.services.monitoring import save_settings, mail_ready
+    from app.services.monitoring import save_settings
+    from app.services.account_mail import ready
     account = banking.get_account(db, p.tenant_id, account_id)
     settings = MonitoringSettings.model_validate(body.model_dump(exclude={"low_balance_threshold"}))
     save_settings(db, account, settings, p.user_id)
@@ -55,7 +143,7 @@ def update_monitoring(account_id: uuid.UUID, body: MonitoringUpdate, db: DB,
     check_low_balance(db, account)
     audit(db, action="account.monitoring.update", tenant_id=p.tenant_id, actor_user_id=p.user_id,
           entity_type="bank_account", entity_id=account.id, after=body.model_dump(mode="json"), ip=p.ip)
-    return {**settings.model_dump(), "email_configured": mail_ready()}
+    return {**settings.model_dump(), "email_configured": ready(db, account)}
 
 
 @router.get("/accounts")

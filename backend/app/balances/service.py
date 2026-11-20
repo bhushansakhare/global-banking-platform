@@ -92,7 +92,8 @@ def convert(db: Session, tenant_id: uuid.UUID, amount: Decimal, base: str, quote
 def alert_balance(db: Session, account: BankAccount) -> AccountBalance | None:
     latest = [b for b in latest_balances(db, account.tenant_id, [account.id])
               if b.balance_type in ("available", "ledger", "current", "statement_closing")
-              and b.source in ("provider", "statement", "demo")]
+              and (b.source in ("provider", "statement", "demo") or
+                   (b.source == "browser" and b.verification_status == "bank_page_observed"))]
     from app.models.statements import Statement
     # Only arithmetically validated statements can drive automatic financial alerts.
     latest = [b for b in latest if b.balance_type != "statement_closing" or db.scalar(

@@ -1,5 +1,6 @@
 """Account-scoped monitoring settings, separate from bank credentials."""
 from decimal import Decimal
+from typing import Literal
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, model_validator
 from sqlalchemy import select
 
@@ -13,6 +14,7 @@ class MonitoringSettings(BaseModel):
     email_enabled: bool = False
     recipients: list[EmailStr] = Field(default_factory=list, max_length=10)
     capture_statement_screenshot: bool = True
+    bank_login_method: Literal["password", "qr"] = "password"
 
     @model_validator(mode="after")
     def require_recipient(self):

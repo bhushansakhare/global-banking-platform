@@ -70,7 +70,27 @@ def eligible_accounts(db: Session, tenant_id: uuid.UUID, *, own_schedule: bool |
         q = q.where(BankAccount.sync_schedule.is_(None))
     elif own_schedule is True:
         q = q.where(BankAccount.sync_schedule.is_not(None))
-    return list(db.scalars(q.order_by(BankAccount.nickname)))
+    accounts = list(db.scalars(q.order_by(BankAccount.nickname)))
+    # A manual-import connection may also have an owner-reviewed browser observation flow.
+    from app.automation.browser_jobs import saved_login_profile, reviewed_statement_flow
+    from app.core.config import get_settings
+    if get_settings().browser_automation_enabled:
+        seen = {a.id for a in accounts}
+        candidates = select(BankAccount).where(BankAccount.tenant_id == tenant_id,
+            BankAccount.deleted_at.is_(None), BankAccount.automation_enabled.is_(True),
+            BankAccount.automation_paused.is_(False),
+            or_(BankAccount.browser_profile_key.is_not(None), BankAccount.browser_identifier_encrypted.is_not(None)))
+        if own_schedule is False:
+            candidates = candidates.where(BankAccount.sync_schedule.is_(None))
+        elif own_schedule is True:
+            candidates = candidates.where(BankAccount.sync_schedule.is_not(None))
+        for account in db.scalars(candidates.order_by(BankAccount.nickname)):
+            if account.id in seen:
+                continue
+            profile = saved_login_profile(db, account)
+            if profile and reviewed_statement_flow(db, account, profile):
+                accounts.append(account)
+    return accounts
 
 
 def manual_accounts(db: Session, tenant_id: uuid.UUID) -> list[BankAccount]:
@@ -90,7 +110,8 @@ def start_run(db: Session, s: AutomationSettings, *, trigger: str, slot: datetim
     if trigger == "manual":
         seen = {a.id for a in accounts}
         saved_accounts = db.scalars(select(BankAccount).where(BankAccount.tenant_id == s.tenant_id,
-            BankAccount.deleted_at.is_(None), BankAccount.browser_identifier_encrypted.is_not(None)))
+            BankAccount.deleted_at.is_(None),
+            or_(BankAccount.browser_identifier_encrypted.is_not(None), BankAccount.browser_profile_key.is_not(None))))
         for account in saved_accounts:
             # Run now is an explicit one-off request; scheduling switches must not silently skip it.
             if account.id not in seen:
@@ -98,9 +119,10 @@ def start_run(db: Session, s: AutomationSettings, *, trigger: str, slot: datetim
                 if saved_login_profile(db, account):
                     accounts.append(account)
     for acc in accounts:
-        if trigger == "manual":
+        if trigger in ("manual", "schedule"):
             from app.automation.browser_jobs import enqueue_saved_login
-            browser_job = enqueue_saved_login(db, acc, user_id, run_id=run_id)
+            browser_job = enqueue_saved_login(db, acc, user_id, run_id=run_id, trigger=trigger,
+                idempotency_key=f"browser:{acc.id}:{slot_key}:{trigger}" if trigger == "schedule" else None)
             if browser_job is not None:
                 created += int(browser_job[1])
                 continue
@@ -113,6 +135,11 @@ def start_run(db: Session, s: AutomationSettings, *, trigger: str, slot: datetim
         # manual-import accounts cannot be collected; only the missing-statement check runs for them
         from app.automation.handlers import _check_missing_statement
         for acc in manual_accounts(db, s.tenant_id):
+            from app.automation.browser_jobs import saved_login_profile, reviewed_statement_flow
+            profile = saved_login_profile(db, acc)
+            flow = reviewed_statement_flow(db, acc, profile) if profile else None
+            if flow and flow.get("purpose") == "bank_observation":
+                continue  # This account intentionally saves a bank screen rather than a statement file.
             _check_missing_statement(db, acc)
     if s.auto_generate_daily_report and created:
         queue.enqueue(db, tenant_id=s.tenant_id, job_type="daily_report", trigger=trigger, run_id=run_id,
@@ -158,14 +185,20 @@ def tick() -> int:
                     if acc.next_sync_at > now:
                         continue
                     slot_key = acc.next_sync_at.strftime("%Y%m%dT%H%M")
-                    queue.enqueue(db, tenant_id=s.tenant_id, job_type="collect_account", account_id=acc.id,
-                                  payload={"lookback_days": s.lookback_days}, trigger="schedule",
-                                  idempotency_key=f"collect:{acc.id}:{slot_key}:account-schedule",
-                                  max_attempts=s.max_attempts, priority=100)
+                    from app.automation.browser_jobs import enqueue_saved_login
+                    browser_job = enqueue_saved_login(db, acc, None, trigger="schedule",
+                        idempotency_key=f"browser:{acc.id}:{slot_key}:account-schedule")
+                    if browser_job is None:
+                        queue.enqueue(db, tenant_id=s.tenant_id, job_type="collect_account", account_id=acc.id,
+                                      payload={"lookback_days": s.lookback_days}, trigger="schedule",
+                                      idempotency_key=f"collect:{acc.id}:{slot_key}:account-schedule",
+                                      max_attempts=s.max_attempts, priority=100)
                     acc.next_sync_at = compute_account_next(acc, s, now)
                 except (ValueError, KeyError) as exc:  # invalid cron/time zone: surface, never crash the tick
                     acc.last_sync_error = f"Invalid account schedule: {exc}"
                     acc.next_sync_at = None
+        from app.integrations.finzola.gateway import schedule_tick
+        schedule_tick(db, now)
         db.commit()
     return started
 

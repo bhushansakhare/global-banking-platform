@@ -3,13 +3,15 @@ import smtplib
 import ssl
 import uuid
 from email.message import EmailMessage
+from email.utils import formatdate
 
 from sqlalchemy import select
 
-from app.core.config import get_settings
 from app.integrations.base.adapter import ConfigurationMissing, ProviderUnavailable
 from app.models.banking import AccountBalance, BankAccount
-from app.services.monitoring import mail_ready, settings_for
+from app.services.monitoring import settings_for
+from app.services.account_mail import mail_settings
+from app.notifications.balance_template import balance_html
 
 
 def send_balance_email(ctx):
@@ -36,15 +38,16 @@ def send_balance_email(ctx):
     recipients = list(dict.fromkeys(str(r) for r in monitoring.recipients))
     if not recipients:
         raise ConfigurationMissing("No account-specific email recipient is configured")
-    if not mail_ready():
-        raise ConfigurationMissing("Configure SMTP_HOST and SMTP_FROM to deliver balance alerts")
+    settings = mail_settings(db, account)
+    if not settings.smtp_host or not settings.smtp_from:
+        raise ConfigurationMissing("Configure this account's sender SMTP settings to deliver balance alerts")
     ctx.progress(30, "Sending balance warning email" if below_target else "Sending balance report email")
-    settings = get_settings()
     message = EmailMessage()
     message["Subject"] = "Bank account balance below target" if below_target else "Bank account balance report: target met"
     message["From"] = settings.smtp_from
     message["To"] = "undisclosed-recipients:;"
     message["Message-ID"] = f"<balance-alert-{job.id}@local.banking>"
+    message["Date"] = formatdate(usegmt=True)
     message.set_content(f"Account: {account.nickname} ({account.account_number_masked})\n"
         f"Status: {'BELOW TARGET - attention required' if below_target else 'TARGET MET'}\n"
         f"Balance type: {balance.balance_type.replace('_', ' ')}\n"
@@ -53,6 +56,7 @@ def send_balance_email(ctx):
         f"Balance as of: {balance.as_of.isoformat()}\n"
         "A statement closing balance describes its statement date, not a live balance.\n"
         "Open the account in your banking software to review the source.\n")
+    message.add_alternative(balance_html(account, balance, below_target=below_target), subtype="html")
     try:
         transport = smtplib.SMTP_SSL if settings.smtp_security == "ssl" else smtplib.SMTP
         kwargs = {"context": ssl.create_default_context()} if settings.smtp_security == "ssl" else {}

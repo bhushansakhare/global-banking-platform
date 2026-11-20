@@ -13,21 +13,24 @@ import { reconApi, statementsApi } from '@/services/api';
 import { download, fetchBlobUrl, request } from '@/services/http';
 import { useAuth } from '@/stores/auth';
 import { bytes, date, dateTime, pct } from '@/utils/format';
+import { StatementAccess, StatementPipeline } from '@/features/statements/StatementAccess';
 
 function Preview({ id, open, onClose, format }: { id: string; open: boolean; onClose: () => void; format: string }) {
   const [state, setState] = useState<{ url?: string; text?: string; error?: string }>({});
   useEffect(() => {
     if (!open) return;
     let url: string | undefined;
-    const path = `/statements/${id}/file`;
+    let cancelled = false;
+    setState({});
+    const path = `/statements/${id}/${format === 'pdf' ? 'preview' : 'file'}`;
     const load = format === 'csv'
       ? request<Response>(path, { query: { inline: true }, raw: true }).then(async (r) => setState({ text: await r.text() }))
-      : fetchBlobUrl(path, { inline: true }).then((r) => { url = r.url; setState({ url: r.url }); });
+      : fetchBlobUrl(path, { inline: true }).then((r) => { url = r.url; if (cancelled) URL.revokeObjectURL(url); else setState({ url: r.url }); });
     load.catch(() => setState({ error: 'Preview unavailable' }));
-    return () => { if (url) URL.revokeObjectURL(url); };
+    return () => { cancelled = true; if (url) URL.revokeObjectURL(url); };
   }, [open, id, format]);
   return (
-    <Modal open={open} onClose={onClose} size="xl" title="Original file preview" description="Exactly as received — never modified.">
+    <Modal open={open} onClose={onClose} size="xl" title="Statement preview" description="PDF previews use your account’s saved password. The original file remains unchanged.">
       {state.error ? <p className="text-sm text-muted">{state.error}</p>
         : state.text !== undefined ? <pre className="max-h-[65vh] overflow-auto rounded-xl bg-surface-2 p-4 text-[12px] font-mono whitespace-pre">{state.text}</pre>
         : state.url && format === 'pdf' ? <iframe title="Statement PDF" src={state.url} className="w-full h-[70vh] rounded-xl border border-line" />
@@ -50,8 +53,8 @@ export default function StatementDetail() {
   const [imagePage, setImagePage] = useState('1');
   const imageDownload = useAction(() => download(`/statements/${id}/screenshot`, { page: Number(imagePage) }, `statement-page-${imagePage}.png`), {});
   const bankImageDownload = useAction(() => download(`/statements/${id}/screenshot`, { source: 'bank' }, 'bank-statement-screen.png'), {});
-  const q = useQuery({ queryKey: ['statement', id], queryFn: () => statementsApi.get(id) });
-  const tx = useQuery({ queryKey: ['statement', id, 'tx'], queryFn: () => statementsApi.transactions(id) });
+  const q = useQuery({ queryKey: ['statement', id], queryFn: () => statementsApi.get(id), refetchInterval: 5000 });
+  const tx = useQuery({ queryKey: ['statement', id, 'tx'], queryFn: () => statementsApi.transactions(id), refetchInterval: 10000 });
   const reprocess = useAction(() => statementsApi.reprocess(id), { success: 'Statement reprocessed', invalidate: [['statement', id], ['statements']] });
   const recon = useAction(() => reconApi.run({ account_id: q.data!.account_id, statement_id: id }), {
     success: 'Reconciliation complete', invalidate: [['recon']], onSuccess: (s) => navigate(`/reconciliation/${s.id}`) });
@@ -68,14 +71,22 @@ export default function StatementDetail() {
       <PageHeader title={<span className="flex flex-wrap items-center gap-2">{s.account_name}<DemoBadge show={s.is_demo} /><StatusBadge status={s.processing_status} /></span>}
         subtitle={`${s.institution ?? ''} · ${date(s.period_start)} – ${date(s.period_end)} · ${s.file?.original_filename ?? ''}`}
         actions={<>
-          <Button variant="outline" icon={<Eye className="h-4 w-4" />} onClick={() => setPreview(true)}>Preview</Button>
+          <Button variant="outline" icon={<Eye className="h-4 w-4" />} disabled={s.document_access?.password_required} onClick={() => setPreview(true)}>Preview</Button>
           <Button variant="outline" icon={<Download className="h-4 w-4" />} onClick={() => download(`/statements/${id}/file`, undefined, s.file?.original_filename)}>Download original</Button>
-          {can('statements:write') && <Button variant="outline" icon={<RefreshCcw className="h-4 w-4" />} loading={reprocess.isPending} onClick={() => reprocess.mutate(undefined)}>Reprocess</Button>}
           {can('statements:write') && s.processing_status === 'needs_review' && s.arithmetic_valid && !!s.transaction_count &&
             <Button variant="outline" onClick={() => setConfirmFigures(true)}>Confirm reviewed figures</Button>}
-          {can('reconciliation:write') && <Button icon={<GitCompareArrows className="h-4 w-4" />} loading={recon.isPending} onClick={() => recon.mutate(undefined)}
-            disabled={!s.period_start}>Reconcile</Button>}
+          {can('reconciliation:read') && s.latest_reconciliation && <Button icon={<GitCompareArrows className="h-4 w-4" />} onClick={() => navigate(`/reconciliation/${s.latest_reconciliation!.id}`)}>View result</Button>}
         </>} />
+      <StatementPipeline statement={s} />
+      <StatementAccess key={s.id} statement={s} editable={can('statements:write')} />
+      {(can('statements:write') || can('reconciliation:write')) && <details className="mb-4">
+        <summary className="cursor-pointer text-sm text-muted">Advanced processing actions</summary>
+        <p className="my-3 text-xs text-muted">Validated extraction continues to reconciliation automatically when enabled. Use these controls only to repeat a step.</p>
+        <div className="flex flex-wrap gap-2">
+          {can('statements:write') && <Button variant="outline" icon={<RefreshCcw className="h-4 w-4" />} loading={reprocess.isPending} onClick={() => reprocess.mutate(undefined)}>Reprocess</Button>}
+          {can('reconciliation:write') && <Button variant="outline" loading={recon.isPending} onClick={() => recon.mutate(undefined)} disabled={!s.period_start || !s.transaction_count || s.document_access?.password_required}>Run reconciliation again</Button>}
+        </div>
+      </details>}
       {s.is_demo && <div className="mb-4"><Notice tone="demo">Synthetic demo statement produced by the Demo Bank Simulator — not a real bank document.</Notice></div>}
       {(s.file?.format === 'pdf' || s.bank_screenshot_available) && <Card className="mb-4">
         <CardHeader title="Statement images" subtitle="Download an image of any PDF page or the bank statement screen captured during collection." />
@@ -84,7 +95,7 @@ export default function StatementDetail() {
             <label className="text-sm">PDF page
               <Input aria-label="Statement image page" type="number" min="1" max={s.file.page_count ?? undefined} value={imagePage} onChange={(e) => setImagePage(e.target.value)} className="mt-1 w-28" />
             </label>
-            <Button variant="outline" loading={imageDownload.isPending} disabled={!Number.isInteger(Number(imagePage)) || Number(imagePage) < 1} onClick={() => imageDownload.mutate(undefined)}>Download page image</Button>
+            <Button variant="outline" loading={imageDownload.isPending} disabled={s.document_access?.password_required || !Number.isInteger(Number(imagePage)) || Number(imagePage) < 1} onClick={() => imageDownload.mutate(undefined)}>Download page image</Button>
           </>}
           {s.bank_screenshot_available && <Button variant="outline" loading={bankImageDownload.isPending} onClick={() => bankImageDownload.mutate(undefined)}>Download bank screen</Button>}
         </div>

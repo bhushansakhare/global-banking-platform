@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query';
 import { BookOpen, GitCompareArrows, Play, Upload } from 'lucide-react';
-import { useRef, useState, type FormEvent } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useEffect, useRef, useState, type FormEvent } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { Button, Card, CardHeader, Field, Input, Select, StatusBadge } from '@/components/ui/primitives';
 import { DataTable, Pagination, type Column } from '@/components/ui/DataTable';
 import { Modal } from '@/components/ui/Modal';
@@ -14,13 +14,14 @@ import { useAuth } from '@/stores/auth';
 import type { ReconSession } from '@/types/api';
 import { date, daysAgo, isoDate, pct, relative } from '@/utils/format';
 
-function RunModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+function RunModal({ open, onClose, accountId }: { open: boolean; onClose: () => void; accountId?: string }) {
   const navigate = useNavigate();
   const [acc, setAcc] = useState('');
   const [mode, setMode] = useState<'statement' | 'period'>('statement');
   const [st, setSt] = useState('');
   const [from, setFrom] = useState(daysAgo(30));
   const [to, setTo] = useState(isoDate(new Date()));
+  useEffect(() => { if (open) { setAcc(accountId ?? ''); setSt(''); } }, [open, accountId]);
   const accounts = useQuery({ queryKey: ['accounts'], queryFn: () => accountsApi.list(), enabled: open });
   const stmts = useQuery({ queryKey: ['statements', 'for', acc], enabled: open && !!acc,
     queryFn: () => statementsApi.list({ account_id: acc, page_size: 50 }) });
@@ -41,7 +42,7 @@ function RunModal({ open, onClose }: { open: boolean; onClose: () => void }) {
         </div>
         {mode === 'statement' ? (
           <Field label="Statement" htmlFor="rr-st"><Select id="rr-st" value={st} disabled={!acc} onChange={(e) => setSt(e.target.value)}>
-            <option value="">Select statement…</option>{stmts.data?.items.filter((s) => s.period_start).map((s) =>
+            <option value="">Select statement…</option>{stmts.data?.items.filter((s) => s.period_start && s.arithmetic_valid && ['processed', 'processed_with_warnings'].includes(s.processing_status)).map((s) =>
               <option key={s.id} value={s.id}>{date(s.period_start)} – {date(s.period_end)} · {s.transaction_count} txns</option>)}</Select></Field>
         ) : (
           <div className="grid grid-cols-2 gap-4">
@@ -59,8 +60,8 @@ function ImportBook({ open, onClose }: { open: boolean; onClose: () => void }) {
   const [file, setFile] = useState<File | null>(null);
   const ref = useRef<HTMLInputElement>(null);
   const accounts = useQuery({ queryKey: ['accounts'], queryFn: () => accountsApi.list(), enabled: open });
-  const imp = useAction(() => transactionsApi.importBook(acc, file!), { success: (r) => `${r.created} entries imported (${r.skipped_duplicates} duplicates skipped)`,
-    invalidate: [['book']], onSuccess: onClose });
+  const imp = useAction(() => transactionsApi.importBook(acc, file!), { success: (r) => `${r.created} entries imported (${r.skipped_duplicates} duplicates skipped). ${r.reconciliations_queued ?? 0} reconciliation check(s) queued automatically.`,
+    invalidate: [['book'], ['recon']], onSuccess: onClose });
   return (
     <Modal open={open} onClose={onClose} title="Import cash-book entries" description="CSV or Excel with Date, Description, Amount (or Debit/Credit) and optional Reference columns. Re-imports are de-duplicated."
       footer={<><Button variant="outline" onClick={onClose}>Cancel</Button><Button disabled={!acc || !file} loading={imp.isPending} onClick={() => imp.mutate(undefined)}
@@ -83,7 +84,11 @@ export default function Reconciliation() {
   const [status, setStatus] = useState('');
   const [run, setRun] = useState(false);
   const [imp, setImp] = useState(false);
-  const list = useQuery({ queryKey: ['recon', 'sessions', page, status], queryFn: () => reconApi.sessions({ page, page_size: 25, status }) });
+  const [params, setParams] = useSearchParams();
+  const accountId = params.get('account_id') ?? '';
+  const accounts = useQuery({ queryKey: ['accounts'], queryFn: () => accountsApi.list() });
+  const list = useQuery({ queryKey: ['recon', 'sessions', page, status, accountId], refetchInterval: 5000,
+    queryFn: () => reconApi.sessions({ page, page_size: 25, status, account_id: accountId }) });
   const latest = list.data?.items ?? [];
   const balanced = latest.filter((s) => s.status === 'balanced').length;
 
@@ -91,6 +96,7 @@ export default function Reconciliation() {
     { key: 'acc', header: 'Account', mobile: 'title', cell: (s) => <div><div className="font-medium text-ink">{s.account_name}</div>
       <div className="text-[12px] text-muted">{date(s.period_start)} – {date(s.period_end)} · {s.trigger}</div></div> },
     { key: 'st', header: 'Status', mobile: 'meta', cell: (s) => <StatusBadge status={s.status} /> },
+    { key: 'scope', header: 'Checks', cell: (s) => <span className="text-xs text-muted">{s.summary?.has_book_side ? 'Bank + cash-book' : 'Statement integrity'}</span> },
     { key: 'm', header: 'Matched', align: 'right', cell: (s) => <span className="num">{s.matched_count}/{s.bank_transaction_count}</span> },
     { key: 'sg', header: 'Suggested', align: 'right', cell: (s) => <span className="num">{s.suggested_count}</span> },
     { key: 'ex', header: 'Exceptions', align: 'right', cell: (s) => <span className="num">{s.exception_count}</span> },
@@ -103,19 +109,27 @@ export default function Reconciliation() {
   return (
     <>
       <PageHeader eyebrow="Control" title="Reconciliation"
-        subtitle="Every run is immutable and reproducible. Uncertain matches are suggested for review — never silently confirmed."
+        subtitle="Validated statements reconcile automatically. Import the account’s cash-book to match your records; uncertain matches stay in review."
         actions={can('reconciliation:write') && <>
           <Button variant="outline" icon={<BookOpen className="h-4 w-4" />} onClick={() => setImp(true)}>Import cash-book</Button>
           <Button icon={<GitCompareArrows className="h-4 w-4" />} onClick={() => setRun(true)}>Run reconciliation</Button></>} />
+      <Card className="mb-4"><div className="grid gap-4 sm:grid-cols-3 text-sm">
+        <div><p className="font-medium">Statement checks</p><p className="mt-1 text-muted">Opening balance + credits − debits is checked against the closing balance.</p></div>
+        <div><p className="font-medium">Cash-book matching</p><p className="mt-1 text-muted">Import entries for the same account to compare amounts, dates and references.</p></div>
+        <div><p className="font-medium">Needs attention?</p><p className="mt-1 text-muted">Password-blocked or unclear extraction waits on the <Link className="link" to="/statements?status=needs_review">Statements page</Link>.</p></div>
+      </div></Card>
       <div className="grid grid-cols-2 xl:grid-cols-4 gap-4 mb-4">
         <StatCard label="Sessions" value={list.data?.total ?? '—'} tone="brand" />
-        <StatCard label="Balanced (this page)" value={balanced} tone="olive" />
+        <StatCard label="Checks passed (this page)" value={balanced} tone="olive" />
         <StatCard label="With exceptions (this page)" value={latest.length - balanced} tone="amber" />
         <StatCard label="Open suggestions (this page)" value={latest.reduce((a, s) => a + s.suggested_count, 0)} tone="accent" />
       </div>
       <Card padded={false}>
         <div className="p-4 border-b border-line flex flex-col sm:flex-row gap-3 sm:items-center sm:justify-between">
           <CardHeader title="Reconciliation history" />
+          <Select aria-label="Bank account" value={accountId} onChange={e => { if (e.target.value) params.set('account_id', e.target.value); else params.delete('account_id'); setParams(params); setPage(1); }} className="sm:w-72">
+            <option value="">All bank accounts</option>{accounts.data?.map(a => <option key={a.id} value={a.id}>{a.nickname} · {a.account_number_masked}</option>)}
+          </Select>
           <Select aria-label="Status" value={status} onChange={(e) => { setStatus(e.target.value); setPage(1); }} className="sm:w-60">
             <option value="">All statuses</option><option value="balanced">Balanced</option><option value="completed_with_exceptions">With exceptions</option>
           </Select>
@@ -126,7 +140,7 @@ export default function Reconciliation() {
             body="Automation reconciles every processed statement. You can also import a cash-book and run one manually." />} />
         {list.data && <Pagination page={page} pages={list.data.pages} total={list.data.total} pageSize={25} onPage={setPage} />}
       </Card>
-      <RunModal open={run} onClose={() => setRun(false)} />
+      <RunModal open={run} onClose={() => setRun(false)} accountId={accountId} />
       <ImportBook open={imp} onClose={() => setImp(false)} />
     </>
   );

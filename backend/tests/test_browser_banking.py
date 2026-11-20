@@ -495,6 +495,34 @@ def test_bank_access_denial_does_not_retry_or_mark_profile_verified(client, owne
         assert db.get(BankAccount, uuid.UUID(account["id"])).last_successful_sync_at is None
 
 
+@pytest.mark.parametrize('url,allowed', [('wss://now.hdfc.bank.in/approval?token=SYNTHETIC', True),
+    ('wss://evil.example/approval', False), ('ws://now.hdfc.bank.in/approval', False)])
+def test_secure_approval_channels_require_reviewed_bank_domains(monkeypatch, url, allowed):
+    from app.integrations.banks import browser_engine
+    original = browser_engine.validate_url
+    monkeypatch.setattr(browser_engine, 'validate_url', lambda location, hosts, **kw: original(location, hosts))
+    ws = Mock(url=url)
+    state = {}
+    browser_engine.route_bank_websocket(ws, HDFC, state)
+    assert ws.connect_to_server.called is allowed
+    assert ws.close.called is not allowed
+    assert 'SYNTHETIC' not in str(state)
+
+
+@pytest.mark.parametrize('code', ['ACCESS_DENIED', 'invalid_state', 'session_expired'])
+def test_transient_callback_error_is_kept_after_bank_redirects_to_login(code):
+    from app.integrations.banks.browser_engine import remember_auth_error, check_bank_access
+    from app.integrations.base.adapter import UserActionRequired
+    state = {}
+    remember_auth_error(f'https://now.hdfc.bank.in/retail-app/select-context?error={code}&code=SECRET&state=SECRET', state)
+    remember_auth_error('https://now.hdfc.bank.in/auth/login?state=OTHER-SECRET', state)
+    assert state['auth_error'] == code.lower()
+    assert state['navigation_stages'] == ['callback', 'login']
+    assert 'SECRET' not in str(state)
+    with pytest.raises(UserActionRequired):
+        check_bank_access(Mock(url='https://now.hdfc.bank.in/auth/login'), state)
+
+
 def test_native_guard_validates_each_redirect_request_without_reading_payload(monkeypatch):
     from app.integrations.banks import browser_engine
     validate = browser_engine.validate_url
@@ -508,6 +536,52 @@ def test_native_guard_validates_each_redirect_request_without_reading_payload(mo
     session.send.assert_any_call("Fetch.continueRequest", {"requestId": "original"})
     callback({"requestId": "redirect", "resourceType": "Document", "request": {"url": "https://evil.example/"}})
     session.send.assert_any_call("Fetch.failRequest", {"requestId": "redirect", "errorReason": "BlockedByClient"})
+    assert blocked == [True]
+
+
+def test_guard_reports_blocked_resource_host_and_token_status_without_secrets(monkeypatch):
+    from app.integrations.banks import browser_engine
+    original = browser_engine.validate_url
+    monkeypatch.setattr(browser_engine, 'validate_url', lambda url, hosts, **kw: original(url, hosts))
+    context, page = Mock(), Mock()
+    state = {}
+    browser_engine.install_native_domain_guard(context, page, HDFC, [False], state)
+    paused = context.new_cdp_session.return_value.on.call_args.args[1]
+    paused({'requestId': 'resource', 'resourceType': 'Fetch',
+            'request': {'url': 'https://api.unreviewed.example/data?token=SYNTHETIC-SECRET'}})
+    assert state['blocked_resource_hosts'] == ['api.unreviewed.example']
+    handlers = {call.args[0]: call.args[1] for call in page.on.call_args_list}
+    response = Mock(url='https://now.hdfc.bank.in/auth/realms/retail/protocol/openid-connect/token?code=SYNTHETIC-SECRET', status=401)
+    response.request.is_navigation_request.return_value = False
+    response.request.resource_type = 'fetch'
+    handlers['response'](response)
+    assert state['auth_exchange_status'] == 401
+    assert state['failed_resource_responses'] == [{'host': 'now.hdfc.bank.in', 'status': 401}]
+    assert 'SYNTHETIC-SECRET' not in str(state)
+
+
+def test_bank_logout_route_stops_waiting_without_claiming_authentication():
+    from app.integrations.banks.browser_engine import check_bank_access, BankSessionEnded
+    with pytest.raises(BankSessionEnded) as error:
+        check_bank_access(Mock(url='https://now.hdfc.bank.in/retail-app/logoutuser'), {})
+    assert error.value.code == 'bank_session_ended'
+
+
+@pytest.mark.parametrize('host', ['mbrww.hdfcbank.com', 'nextgenhtml.hdfcbank.com', 'api-now.hdfc.bank.in'])
+def test_hdfc_observed_resource_hosts_are_allowed_only_as_resources(monkeypatch, host):
+    from app.integrations.banks import browser_engine
+    original = browser_engine.validate_url
+    monkeypatch.setattr(browser_engine, 'validate_url', lambda url, hosts, **kw: original(url, hosts))
+    context, page = Mock(), Mock()
+    state, blocked = {}, [False]
+    browser_engine.install_native_domain_guard(context, page, HDFC, blocked, state)
+    session = context.new_cdp_session.return_value
+    paused = session.on.call_args.args[1]
+    paused({'requestId': 'asset', 'resourceType': 'Script', 'request': {'url': f'https://{host}/synthetic.js'}})
+    session.send.assert_any_call('Fetch.continueRequest', {'requestId': 'asset'})
+    assert blocked == [False] and not state.get('blocked_resource_hosts')
+    paused({'requestId': 'document', 'resourceType': 'Document', 'request': {'url': f'https://{host}/login'}})
+    session.send.assert_any_call('Fetch.failRequest', {'requestId': 'document', 'errorReason': 'BlockedByClient'})
     assert blocked == [True]
 
 
@@ -673,6 +747,90 @@ def test_qr_login_rejects_password_submission_and_switching_an_active_session(cl
     assert client.post(url, json={**base, 'qr_login': False}).status_code == 409
 
 
+@pytest.mark.parametrize('label', ['Click here to Scan QR Code',
+    'Click here to Scan QR Code. It’s secure & fast', 'Login via QR Code'])
+def test_hdfc_qr_option_is_selected_once_on_the_official_page(monkeypatch, label):
+    from app.integrations.banks import browser_engine
+    from playwright.sync_api import TimeoutError
+    page = Mock(url='https://now.hdfc.bank.in/auth/login')
+    page.get_by_role.return_value.and_.return_value.wait_for.side_effect = TimeoutError('No card in this variant')
+    target = page.get_by_text.return_value.and_.return_value
+    target.count.return_value = 1
+    target.inner_text.return_value = label
+    target.get_attribute.return_value = ''
+    guard = Mock()
+    monkeypatch.setattr(browser_engine, 'validate_url', guard)
+    assert browser_engine.open_bank_qr_login(page, HDFC) is True
+    pattern = page.get_by_text.call_args.args[0]
+    assert pattern.search(label)
+    assert not pattern.search('Scan & Pay QR Code')
+    assert not pattern.search('Confirm payment QR Code')
+    guard.assert_called_once_with(page.url, HDFC.domains, resolve=True)
+    target.click.assert_called_once()
+    page.fill.assert_not_called()
+
+
+def test_changed_or_ambiguous_qr_option_stays_open_for_manual_selection(monkeypatch):
+    from playwright.sync_api import TimeoutError
+    from app.integrations.banks import browser_engine
+    page = Mock(url='https://now.hdfc.bank.in/auth/login')
+    page.get_by_role.return_value.and_.return_value.wait_for.side_effect = TimeoutError('No card in this variant')
+    target = page.get_by_text.return_value.and_.return_value
+    target.wait_for.side_effect = TimeoutError('Synthetic missing option')
+    assert browser_engine.open_bank_qr_login(page, HDFC) is False
+    target.click.assert_not_called()
+    page.close.assert_not_called()
+    target.wait_for.side_effect = None
+    target.count.return_value = 2
+    assert browser_engine.open_bank_qr_login(page, HDFC) is False
+    target.click.assert_not_called()
+
+
+def test_run_now_remembers_qr_mode_without_requiring_saved_password(client, owner, browser_enabled, monkeypatch):
+    account = _hdfc_manual_account(client)
+    calls = []
+    monkeypatch.setattr(browser_jobs, 'retrieve', lambda *args, **kw: calls.append(kw) or [])
+    response = client.post(f"/api/v1/accounts/{account['id']}/browser/start", json={
+        'profile_key': 'hdfc_bank', 'login_only': True, 'qr_login': True})
+    assert response.status_code == 202, response.text
+    run_pending_once()
+    status = client.get(f"/api/v1/accounts/{account['id']}/browser").json()
+    assert status['preferred_login_method'] == 'qr' and status['has_password'] is False
+    response = client.post(f"/api/v1/accounts/{account['id']}/sync")
+    assert response.status_code == 202, response.text
+    with session_scope() as db:
+        job = db.get(AutomationJob, uuid.UUID(response.json()['job_id']))
+        assert job.payload['qr_login'] is True and job.payload['authenticate'] is False
+    run_pending_once()
+    assert calls[-1]['qr_login'] is True
+    assert calls[-1]['password'] == '' and calls[-1]['customer_id'] == ''
+
+
+def test_qr_option_refuses_unreviewed_domain(monkeypatch):
+    from app.integrations.banks import browser_engine
+    from playwright.sync_api import TimeoutError
+    page = Mock(url='https://unreviewed.example/login')
+    page.get_by_role.return_value.and_.return_value.wait_for.side_effect = TimeoutError('No card in this variant')
+    target = page.get_by_text.return_value.and_.return_value
+    target.count.return_value = 1
+    monkeypatch.setattr(browser_engine, 'validate_url', Mock(side_effect=ValueError('Wrong bank domain')))
+    assert browser_engine.open_bank_qr_login(page, HDFC) is False
+    target.click.assert_not_called()
+
+
+def test_hdfc_qr_uses_real_login_card_before_its_noninteractive_hint(monkeypatch):
+    from app.integrations.banks import browser_engine
+    page = Mock(url='https://now.hdfc.bank.in/auth/login')
+    card = page.get_by_role.return_value.and_.return_value
+    card.count.return_value = 1
+    card.inner_text.return_value = 'Login without Password NEW Scan using your HDFC Bank App secured with Kavach'
+    card.get_attribute.return_value = ''
+    monkeypatch.setattr(browser_engine, 'validate_url', Mock())
+    assert browser_engine.open_bank_qr_login(page, HDFC) is True
+    card.click.assert_called_once()
+    page.get_by_text.return_value.and_.return_value.click.assert_not_called()
+
+
 def test_qr_approved_supported_workflow_can_continue_to_statement_pipeline(client, owner, browser_enabled, monkeypatch):
     account = _hdfc_manual_account(client)
     assert client.put('/api/v1/banks/browser-profiles/example_bank', json=permitted_profile()).status_code == 200
@@ -683,6 +841,7 @@ def test_qr_approved_supported_workflow_can_continue_to_statement_pipeline(clien
     assert response.status_code == 202, response.text
     run_pending_once()
     assert calls[0]['password'] == '' and calls[0]['customer_id'] == '' and calls[0]['login_only'] is False
+    assert calls[0]['qr_login'] is True
     with session_scope() as db:
         job = db.get(AutomationJob, uuid.UUID(response.json()['job_id']))
         assert job.status == 'succeeded' and job.result['data_retrieved'] is True

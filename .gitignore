@@ -26,6 +26,8 @@ desktop/src-tauri/gen/
 storage/statements/*
 storage/reports/*
 storage/exports/*
+storage/bank_evidence/
+docs/previews/
 !storage/**/.gitkeep
 
 # misc

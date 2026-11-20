@@ -143,8 +143,14 @@ def browser_status(account_id: uuid.UUID, db: DB, p: Principal = require("accoun
                                                AutomationJob.job_type.in_(["open_bank_login", "collect_account"]))
                     .order_by(AutomationJob.created_at.desc()).limit(1))
     credentials = scoped_credentials(a, preferred) if preferred else {}
+    from app.services.monitoring import settings_for as monitoring_for
+    monitoring = monitoring_for(db, a)
+    from app.automation.browser_jobs import reviewed_statement_flow
+    capture_flow = reviewed_statement_flow(db, a, preferred) if preferred else None
     return {"enabled": get_settings().browser_automation_enabled,
-            "browser_mode": "headed", "verification_wait_seconds": get_settings().browser_login_timeout_seconds,
+            "browser_mode": "headed", "verification_wait_seconds": monitoring.verification_wait_seconds,
+            "preferred_login_method": monitoring.bank_login_method,
+            "observation_supported": bool(capture_flow and capture_flow.get("purpose") == "bank_observation"),
             "profile_key": preferred.key if preferred else None,
             "has_customer_id": bool(credentials.get("customer_id")),
             "has_password": bool(credentials.get("password")),
@@ -164,6 +170,8 @@ def start_browser(account_id: uuid.UUID, body: BrowserStart, db: DB,
     # Serialise connection changes and queue creation for this account.
     db.execute(select(type(a).id).where(type(a).id == a.id).with_for_update())
     profile = profile_for(db, p.tenant_id, body.profile_key)
+    from app.automation.browser_jobs import reviewed_statement_flow, reset_statement_review
+    capture_reviewed = bool(reviewed_statement_flow(db, a, profile))
     if profile.country != a.country_code or (profile.currencies and a.currency not in profile.currencies):
         raise ValidationFailed("Bank profile country/currency does not match this account")
     if a.account_type not in profile.account_types:
@@ -184,6 +192,12 @@ def start_browser(account_id: uuid.UUID, body: BrowserStart, db: DB,
         if not credentials.get("customer_id") or not credentials.get("password"):
             raise ValidationFailed("Save your Customer ID and password before pressing Authenticate",
                                    code="saved_login_required")
+    if body.qr_login or body.authenticate:
+        from app.services.monitoring import settings_for as monitoring_for, save_settings
+        monitoring = monitoring_for(db, a).model_copy(update={"bank_login_method": "qr" if body.qr_login else "password"})
+        save_settings(db, a, monitoring, p.user_id)
+        if body.qr_login:
+            a.browser_profile_key = profile.key
     from app.models.automation import AutomationJob
     active = db.scalar(select(AutomationJob).where(AutomationJob.account_id == a.id,
                        AutomationJob.status.in_(queue.ACTIVE_STATES),
@@ -193,8 +207,12 @@ def start_browser(account_id: uuid.UUID, body: BrowserStart, db: DB,
             raise Conflict("Close the current bank session before switching the login method")
         if active.status == "awaiting_user" and ((body.login_only and active.payload.get("profile_key") == profile.key)
                                                  or (not body.login_only and a.browser_profile_key == profile.key)):
-            active.payload = {**active.payload, "interactive_approved": not body.login_only or body.authenticate,
-                              "authenticate": body.authenticate, "qr_login": body.qr_login, "user_requested_browser": True}
+            reset_statement_review(db, active)
+            active.payload = {**{k: v for k, v in active.payload.items() if k != "review_steps"},
+                              "interactive_approved": not body.login_only or body.authenticate,
+                              "authenticate": body.authenticate, "qr_login": body.qr_login,
+                              "user_requested_browser": True, "statement_review": capture_reviewed}
+            active.result = {"data_retrieved": False}
             active.trigger = "manual"
             active.status, active.run_after, active.requires_user_action = "queued", queue.now(), None
             active.error_code = active.error_message = None
@@ -226,7 +244,8 @@ def start_browser(account_id: uuid.UUID, body: BrowserStart, db: DB,
                                 job_type="open_bank_login" if body.login_only else "collect_account",
                                 account_id=a.id, payload={"profile_key": profile.key,
                                 "date_from": start.isoformat(), "date_to": end.isoformat(), "authenticate": body.authenticate,
-                                "user_requested_browser": True, "qr_login": body.qr_login},
+                                "user_requested_browser": True, "qr_login": body.qr_login,
+                                "statement_review": capture_reviewed},
                                 max_attempts=1, created_by=p.user_id)
     audit(db, action="browser.login.open" if body.login_only else "browser.sync.start", tenant_id=p.tenant_id,
           actor_user_id=p.user_id, entity_type="bank_account", entity_id=a.id, meta={"profile_key": profile.key})

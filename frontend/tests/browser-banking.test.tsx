@@ -35,6 +35,22 @@ describe('Bank browser connection', () => {
     })).toBe(true));
   });
 
+  it('uses preferred QR mode when Authenticate is pressed, even without a saved password', async () => {
+    const current = structuredClone(status);
+    current.preferred_login_method = 'qr';
+    current.has_password = false;
+    current.profiles[0].capabilities.saved_login = true;
+    const fetch = mockFetch({ '/accounts/a1/browser': current,
+      '/accounts/a1/browser/start': { job_id: 'qr1', status: 'queued', created: true } });
+    renderWithProviders(<BrowserBankConnection account={account} />);
+    await userEvent.click(await screen.findByRole('button', { name: 'Authenticate' }));
+    await waitFor(() => expect(fetch.mock.calls.some(([url, init]) => {
+      if (!String(url).endsWith('/browser/start')) return false;
+      const body = JSON.parse(String(init?.body));
+      return body.qr_login === true && body.authenticate === false && !body.password && !body.customer_id;
+    })).toBe(true));
+  });
+
   it('opens official login without claiming an unverified statement workflow works', async () => {
     const fetch = mockFetch({ '/accounts/a1/browser': status,
       '/accounts/a1/browser/start': { job_id: 'j1', status: 'queued', created: true } });

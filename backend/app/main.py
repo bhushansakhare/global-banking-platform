@@ -19,7 +19,7 @@ from app.core.errors import install_error_handlers
 from app.core.logging import configure_logging, get_logger
 from app.core.ratelimit import limiter
 from app.database.session import get_engine, session_scope
-from app.api.routes import browser_banking
+from app.api.routes import browser_banking, finzola
 
 log = get_logger("app")
 AUTH_PATHS = ("/auth/login", "/auth/setup", "/auth/refresh")
@@ -106,7 +106,7 @@ def create_app(*, with_lifespan: bool = True) -> FastAPI:
     api = APIRouter(prefix=s.api_prefix)
     for r in (auth.router, users.router, institutions.router, accounts.router, statements.router,
               transactions.router, reconciliation.router, automation.router, misc.router, webhooks.router,
-              browser_banking.router):
+              browser_banking.router, finzola.router):
         api.include_router(r)
 
     @api.get("/health", tags=["system"])

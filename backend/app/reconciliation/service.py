@@ -5,7 +5,7 @@ import uuid
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from app.audit.service import record as audit
@@ -36,14 +36,16 @@ def _pick_statement(db: Session, account_id: uuid.UUID, start: date, end: date) 
 def run_reconciliation(db: Session, *, tenant_id: uuid.UUID, account_id: uuid.UUID, period_start: date | None = None,
                        period_end: date | None = None, statement_id: uuid.UUID | None = None,
                        trigger: str = "manual", user_id: uuid.UUID | None = None, job_id: uuid.UUID | None = None,
-                       rules_override: dict | None = None) -> ReconciliationSession:
+                       rules_override: dict | None = None, reviewed_only: bool = False,
+                       book_ids: list[uuid.UUID] | None = None) -> ReconciliationSession:
     account = db.scalar(select(BankAccount).where(BankAccount.id == account_id, BankAccount.tenant_id == tenant_id,
                                                   BankAccount.deleted_at.is_(None)))
     if account is None:
         raise NotFound("Account not found")
     statement: Statement | None = None
     if statement_id:
-        statement = db.scalar(select(Statement).where(Statement.id == statement_id, Statement.tenant_id == tenant_id))
+        statement = db.scalar(select(Statement).where(Statement.id == statement_id, Statement.tenant_id == tenant_id,
+            Statement.account_id == account_id, Statement.deleted_at.is_(None)))
         if statement is None or statement.period_start is None or statement.period_end is None:
             raise ValidationFailed("Statement not found or has no processed period")
         period_start, period_end = statement.period_start, statement.period_end
@@ -52,6 +54,8 @@ def run_reconciliation(db: Session, *, tenant_id: uuid.UUID, account_id: uuid.UU
     if period_end < period_start:
         raise ValidationFailed("Period end must not be before period start")
     statement = statement or _pick_statement(db, account_id, period_start, period_end)
+    if reviewed_only:
+        statement = None  # An expense comparison is not a statement closing-balance certification.
 
     rules = Rules.from_dict({**tenant_rules(db, tenant_id).to_dict(), **(rules_override or {})})
     session = ReconciliationSession(tenant_id=tenant_id, account_id=account_id,
@@ -63,10 +67,19 @@ def run_reconciliation(db: Session, *, tenant_id: uuid.UUID, account_id: uuid.UU
 
     txns = db.scalars(select(Transaction).where(Transaction.account_id == account_id,
                                                 Transaction.booking_date.between(period_start, period_end))).all()
+    if reviewed_only:
+        from app.integrations.finzola.bridge import valid_evidence
+        evidence_cache = {}
+        txns = [t for t in txns if valid_evidence(db, t, evidence_cache)]
     pad = timedelta(days=rules.date_tolerance_days)
-    books = db.scalars(select(BookEntry).where(BookEntry.account_id == account_id, BookEntry.deleted_at.is_(None),
-                                               BookEntry.entry_date.between(period_start - pad, period_end + pad))
-                       ).all()
+    book_query = select(BookEntry).where(BookEntry.account_id == account_id, BookEntry.deleted_at.is_(None),
+        BookEntry.entry_date.between(period_start - pad, period_end + pad),
+        or_(BookEntry.source != "finzola", BookEntry.raw_data["finzola_validation"].astext == "valid"))
+    if book_ids is not None:
+        book_query = book_query.where(BookEntry.id.in_(book_ids))
+    else:
+        book_query = book_query.where(BookEntry.source != "finzola")
+    books = db.scalars(book_query).all()
     # Book entries already matched to transactions outside this period are not available
     txn_ids = {t.id for t in txns}
 

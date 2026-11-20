@@ -87,9 +87,9 @@ def test_email_delivery_uses_only_account_recipient(client, owner, monkeypatch, 
         assert run_pending_once() == 1
         message = smtp.send_message.call_args.args[0]
         assert smtp.send_message.call_args.kwargs['to_addrs'] == ['account-alert@example.com']
-        assert f'{Decimal(amount):,.2f} INR' in message.get_content()
+        assert f'{Decimal(amount):,.2f} INR' in message.get_body(preferencelist=('plain',)).get_content()
         assert ('below target' in message['Subject']) is below_target
-        assert ('Status: TARGET MET' in message.get_content()) is not below_target
+        assert ('Status: TARGET MET' in message.get_body(preferencelist=('plain',)).get_content()) is not below_target
         assert 'synthetic-secret' not in message.as_string()
         smtp.starttls.assert_called_once()
         with session_scope() as db:
@@ -270,7 +270,7 @@ def test_each_account_uses_its_own_target_and_recipient(client, owner, monkeypat
         assert set(deliveries) == {'first@example.com', 'second@example.com'}
         assert 'target met' in deliveries['first@example.com']['Subject']
         assert 'below target' in deliveries['second@example.com']['Subject']
-        assert 'Target: 900.00 INR' in deliveries['first@example.com'].get_content()
-        assert 'Target: 1,500.00 INR' in deliveries['second@example.com'].get_content()
+        assert 'Target: 900.00 INR' in deliveries['first@example.com'].get_body(preferencelist=('plain',)).get_content()
+        assert 'Target: 1,500.00 INR' in deliveries['second@example.com'].get_body(preferencelist=('plain',)).get_content()
     finally:
         get_settings.cache_clear()

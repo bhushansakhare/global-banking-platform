@@ -176,7 +176,8 @@ def get_transaction(transaction_id: uuid.UUID, db: DB, p: Principal = require("t
 def list_book_entries(db: DB, p: Principal = require("transactions:read"), account_id: uuid.UUID | None = None,
                       status: str | None = None, date_from: date | None = None, date_to: date | None = None,
                       page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=500)) -> dict:
-    q = select(BookEntry).where(BookEntry.tenant_id == p.tenant_id, BookEntry.deleted_at.is_(None))
+    q = select(BookEntry).where(BookEntry.tenant_id == p.tenant_id, BookEntry.deleted_at.is_(None),
+                               BookEntry.source != "finzola")
     if account_id:
         q = q.where(BookEntry.account_id == account_id)
     if status:
@@ -200,6 +201,8 @@ def create_book_entry(body: BookEntryCreate, db: DB, p: Principal = require("tra
     db.flush()
     audit(db, action="book_entry.create", tenant_id=p.tenant_id, actor_user_id=p.user_id, entity_type="book_entry",
           entity_id=b.id, after=body.model_dump(mode="json"))
+    from app.statements.pipeline import reconcile_book_changes
+    reconcile_book_changes(db, acc, [b.entry_date], revision=f"book:{b.id}", user_id=p.user_id)
     return S.book_entry(b)
 
 
@@ -228,6 +231,7 @@ async def import_book_entries(db: DB, account_id: uuid.UUID = Form(...), file: U
         raise ValidationFailed("No entries recognised. Expected columns: Date, Description, Amount (or Debit/Credit)"
                                ", Reference.", details=result.warnings[:5])
     created = skipped = 0
+    changed_dates = []
     for r in result.rows:
         ext = f"import:{r.booking_date}:{r.amount}:{(r.reference or '')[:60]}:{r.line_number}"
         if db.scalar(select(BookEntry.id).where(BookEntry.account_id == acc.id, BookEntry.external_ref == ext)):
@@ -237,6 +241,11 @@ async def import_book_entries(db: DB, account_id: uuid.UUID = Form(...), file: U
                          description=r.description, reference=r.reference, external_ref=ext, amount=r.amount,
                          currency=acc.currency, source="import", raw_data=r.raw))
         created += 1
+        changed_dates.append(r.booking_date)
     audit(db, action="book_entry.import", tenant_id=p.tenant_id, actor_user_id=p.user_id,
           meta={"created": created, "skipped": skipped, "file": file.filename})
-    return {"created": created, "skipped_duplicates": skipped}
+    db.flush()
+    import hashlib
+    from app.statements.pipeline import reconcile_book_changes
+    queued = reconcile_book_changes(db, acc, changed_dates, revision=f"book:{hashlib.sha256(content).hexdigest()}", user_id=p.user_id)
+    return {"created": created, "skipped_duplicates": skipped, "reconciliations_queued": queued}

@@ -83,3 +83,6 @@ http://127.0.0.1:8000/api/docs). All quality gates: `scripts\test.cmd`.
 
 Browser implementation audit, changed files, verified capabilities and Windows commands:
 [Dynamic browser banking](docs/BROWSER_BANKING.md).
+## Finzola integration
+
+Open **Finzola** in the sidebar or `/integrations/finzola` for gateway import, account mapping, reviewed bank comparison, organization destinations and acknowledged delivery tracking. The integration uses this project's existing PostgreSQL queue and reconciliation engine. External keys are configured through the UI; live provider compatibility remains unverified until configured and tested. See [the implementation and setup guide](docs/FINZOLA.md).

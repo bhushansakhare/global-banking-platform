@@ -210,6 +210,7 @@ def collect_account(ctx: JobContext) -> dict[str, Any]:
 
     if settings.auto_reconcile and not new_statements:
         has_book = db.scalar(select(func.count(BookEntry.id)).where(BookEntry.account_id == account.id,
+                                                                    BookEntry.source != "finzola",
                                                                     BookEntry.deleted_at.is_(None)))
         if has_book:
             p_end = today - timedelta(days=1)
@@ -252,12 +253,6 @@ def parse_statement(ctx: JobContext) -> dict[str, Any]:
     db.refresh(st)
     result = {"statement_id": str(st_id), "status": st.processing_status, "rows": pj.rows_extracted,
               "inserted": pj.rows_inserted, "duplicates": pj.rows_duplicate}
-    settings = settings_for(db, job.tenant_id)
-    if settings.auto_reconcile and st.processing_status in ("processed", "processed_with_warnings", "needs_review") \
-            and st.period_start and st.period_end:
-        queue.enqueue(db, tenant_id=job.tenant_id, job_type="reconcile_account", account_id=st.account_id,
-                      payload={"statement_id": str(st.id)}, idempotency_key=f"recon:stmt:{st.id}",
-                      trigger="pipeline", parent_job_id=job.id, run_id=job.run_id, priority=80)
     if pj.status == "failed":
         result["error"] = pj.error
     return result
@@ -313,3 +308,7 @@ HANDLERS["open_bank_login"] = open_bank_login
 from app.notifications.email import send_balance_email  # noqa: E402
 HANDLERS["low_balance_email"] = send_balance_email
 HANDLERS["balance_email"] = send_balance_email
+from app.integrations.finzola.gateway import fetch_job  # noqa: E402
+from app.integrations.finzola.bridge import process_job  # noqa: E402
+from app.integrations.finzola.outbound import delivery_job, test_job  # noqa: E402
+HANDLERS.update(finzola_fetch=fetch_job, finzola_process=process_job, finzola_deliver=delivery_job, finzola_test=test_job)
